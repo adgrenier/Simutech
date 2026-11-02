@@ -21,17 +21,48 @@ values; min and max are the day's extremes.
 from __future__ import annotations
 
 import html
+import json
 from pathlib import Path
 
 import pandas as pd
 
 FULL_SECOND = 50
+SAMPLES_FILE = "report_samples.json"
 STATS = ("mean", "ac_rms", "min", "max", "std")
 _DAILY_AGG = {"mean": "mean", "ac_rms": "mean", "std": "mean", "min": "min", "max": "max"}
 
 
-def build_report_data(logger: str, summary: pd.DataFrame | None, n_samples: int,
-                      skipped: list[Path]) -> dict:
+def build_report_data(logger: str, out_dir: Path, kept_rows: dict[str, int],
+                      checkpoint: dict, skipped: list[Path]) -> dict:
+    """Report data over every Summary file of the Logger in `out_dir`.
+
+    `kept_rows` maps the Raw files condensed this run to their kept 50 Hz rows. Row
+    counts are persisted in a sidecar so the -7999 share stays cumulative across
+    incremental runs (entries for files no longer in `checkpoint` are dropped).
+    Duplicate seconds spanning two separate runs make that share slightly pessimistic.
+    """
+    files = sorted(Path(out_dir).glob(f"{logger}_*.parquet"))
+    summary = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True) if files else None
+    return _report_data(logger, summary, _sample_total(Path(out_dir), kept_rows, checkpoint),
+                        skipped)
+
+
+def _sample_total(out_dir: Path, kept_rows: dict[str, int], checkpoint: dict) -> int:
+    path = out_dir / SAMPLES_FILE
+    try:
+        counts = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        counts = {}
+    counts.update(kept_rows)
+    counts = {k: v for k, v in counts.items() if k in checkpoint}
+    if kept_rows:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
+    return sum(counts.values())
+
+
+def _report_data(logger: str, summary: pd.DataFrame | None, n_samples: int,
+                 skipped: list[Path]) -> dict:
     data = {"logger": logger, "n_samples": int(n_samples),
             "skipped_files": [p.name for p in skipped], "channels": {}}
     if summary is None or summary.empty:

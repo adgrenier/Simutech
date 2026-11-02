@@ -87,3 +87,14 @@ def test_no_data_still_reports_skipped(tmp_path):
     result = condense(cfg, raw, "Tower_Bot")
     assert result.report["skipped_files"] == ["tow_bot_bad.csv"]
     assert result.report["channels"] == {}
+
+
+def test_report_is_cumulative_across_incremental_runs(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    vals = [[1.0, 2.0]] * 50
+    write_raw(raw, "tow_bot_a.csv", pd.Timestamp("2026-03-10 08:00:00"), vals)
+    condense(cfg, raw, "Tower_Bot")
+    write_raw(raw, "tow_bot_b.csv", pd.Timestamp("2026-03-11 08:00:00"), vals)
+    result = condense(cfg, raw, "Tower_Bot")
+    assert sorted(result.report["channels"]["Bend_00"]["daily"]) == ["2026-03-10", "2026-03-11"]
+    assert result.report["channels"]["Bend_00"]["missing_share"] == 0.0

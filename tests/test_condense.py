@@ -3,6 +3,8 @@
 Only the public entry point (`condense`) and its output Parquet files are used.
 """
 import math
+import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -210,3 +212,128 @@ def test_duplicate_seconds_across_files_keep_later_files_rows(tmp_path):
     ch0 = df[df.channel == "Bend_00"].sort_values("timestamp_utc")
     assert list(ch0["mean"]) == [1.0, 1.0, 5.0, 5.0]
     assert list(ch0.n_valid) == [50, 50, 50, 50]  # never double-counted
+
+
+# --- incremental, idempotent runs ---------------------------------------------------
+
+def age(path, seconds=3600):
+    """Make a Raw file look like it was last written `seconds` ago."""
+    t = time.time() - seconds
+    os.utime(path, (t, t))
+
+
+def out_files(tmp_path):
+    return sorted((tmp_path / "out" / "Tower_Bot").glob("*.parquet"))
+
+
+def test_rerun_only_processes_new_files_and_keeps_earlier_output(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    first = condense(cfg, raw, "Tower_Bot")
+    assert first.summary["processed"] == 1
+    day_before = read_day(tmp_path, "2026-03-10")
+
+    again = condense(cfg, raw, "Tower_Bot")
+    assert (again.summary["processed"], again.summary["already_done"]) == (0, 1)
+    pd.testing.assert_frame_equal(day_before, read_day(tmp_path, "2026-03-10"))
+
+    write_raw(raw, "tow_bot_2026_03_10_0825.csv", pd.Timestamp("2026-03-10 08:25:00"), [[2.0, 2.0]] * 50)
+    later = condense(cfg, raw, "Tower_Bot")
+    assert (later.summary["processed"], later.summary["already_done"]) == (1, 1)
+    df = read_day(tmp_path, "2026-03-10")
+    assert list(df[df.channel == "Bend_00"].sort_values("timestamp_utc")["mean"]) == [1.0, 2.0]
+
+
+def test_incremental_output_equals_single_full_run(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    a, b = "tow_bot_2026_03_10_0815.csv", "tow_bot_2026_03_10_0825.csv"
+    write_raw(raw, a, pd.Timestamp("2026-03-10 08:15:00"), [[float(i % 5), 1.0] for i in range(100)])
+    condense(cfg, raw, "Tower_Bot")
+    write_raw(raw, b, pd.Timestamp("2026-03-10 08:25:00"), [[float(i % 3), 2.0] for i in range(100)])
+    condense(cfg, raw, "Tower_Bot")
+    incremental = read_day(tmp_path, "2026-03-10")
+
+    full_cfg = dict(cfg, output_folder=str(tmp_path / "out_full"))
+    condense(full_cfg, raw, "Tower_Bot")
+    full = pd.read_parquet(tmp_path / "out_full" / "Tower_Bot" / "Tower_Bot_2026-03-10.parquet")
+    pd.testing.assert_frame_equal(incremental, full)
+
+
+def test_checkpoint_lives_outside_the_raw_folder(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    before = sorted(p.name for p in raw.iterdir())
+    condense(cfg, raw, "Tower_Bot")
+    assert sorted(p.name for p in raw.iterdir()) == before
+
+
+def test_start_date_ignores_earlier_files(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_09_0815.csv", pd.Timestamp("2026-03-09 08:15:00"), [[1.0, 1.0]] * 50)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    cfg["start_date"] = "2026-03-10"
+    result = condense(cfg, raw, "Tower_Bot")
+    assert [p.name for p in out_files(tmp_path)] == ["Tower_Bot_2026-03-10.parquet"]
+    assert result.summary["processed"] == 1
+
+    # the start date can also be passed per call, and moving it earlier picks up the backlog
+    result = condense(cfg, raw, "Tower_Bot", start_date="2026-03-01")
+    assert result.summary["processed"] == 2  # files cut by the old start date are redone
+    assert [p.name for p in out_files(tmp_path)] == ["Tower_Bot_2026-03-09.parquet",
+                                                     "Tower_Bot_2026-03-10.parquet"]
+
+
+def test_recently_modified_file_is_retried_on_a_later_run(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    cfg["loggers"]["Tower_Bot"]["settle_seconds"] = 60
+    name = "tow_bot_2026_03_10_0815.csv"
+    write_raw(raw, name, pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)  # just written
+    result = condense(cfg, raw, "Tower_Bot")
+    assert [p.name for p in result.pending] == [name]
+    assert out_files(tmp_path) == []
+
+    age(raw / name)
+    result = condense(cfg, raw, "Tower_Bot")
+    assert result.pending == [] and result.summary["processed"] == 1
+    assert len(out_files(tmp_path)) == 1
+
+
+def test_incomplete_last_row_is_retried_until_complete(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    name = "tow_bot_2026_03_10_0815.csv"
+    write_raw(raw, name, pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    full = (raw / name).read_text()
+    (raw / name).write_text(full[:-6])  # cut mid-row, no trailing newline
+    age(raw / name)
+    result = condense(cfg, raw, "Tower_Bot")
+    assert [p.name for p in result.pending] == [name]
+    assert result.skipped == [] and out_files(tmp_path) == []
+
+    (raw / name).write_text(full)
+    age(raw / name)
+    result = condense(cfg, raw, "Tower_Bot")
+    assert result.pending == [] and result.summary["processed"] == 1
+    assert read_day(tmp_path, "2026-03-10").n_valid.iloc[0] == 50
+
+
+def test_failing_file_is_reported_and_run_continues(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    write_raw(raw, "tow_bot_2026_03_10_0825.csv", pd.Timestamp("2026-03-10 08:25:00"), [["abc", 1.0]] * 50)
+    write_raw(raw, "tow_bot_2026_03_10_0835.csv", pd.Timestamp("2026-03-10 08:35:00"), [[3.0, 1.0]] * 50)
+    result = condense(cfg, raw, "Tower_Bot")
+    assert [p.name for p, _ in result.failed] == ["tow_bot_2026_03_10_0825.csv"]
+    assert result.summary == {"processed": 2, "already_done": 0, "skipped": 0, "pending": 0, "failed": 1}
+    df = read_day(tmp_path, "2026-03-10")
+    assert sorted(df[df.channel == "Bend_00"]["mean"]) == [1.0, 3.0]
+
+
+def test_stuck_run_spanning_two_incremental_runs_is_flagged(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    cfg["loggers"]["Tower_Bot"]["stuck_window_seconds"] = 3
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 100)
+    condense(cfg, raw, "Tower_Bot")
+    assert not read_day(tmp_path, "2026-03-10").stuck.any()  # 2 flat seconds so far
+    write_raw(raw, "tow_bot_2026_03_10_0816.csv", pd.Timestamp("2026-03-10 08:15:02"), [[1.0, 1.0]] * 50)
+    condense(cfg, raw, "Tower_Bot")
+    assert read_day(tmp_path, "2026-03-10").stuck.all()
