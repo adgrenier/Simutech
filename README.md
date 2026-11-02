@@ -16,6 +16,16 @@ units, and `output_folder` (keep it local, not on the storage server). The run w
 match the Channel list are skipped and returned in `result.skipped`. The table layout is
 documented in the docstring of `src/simutech/condense.py`.
 
+### All four Loggers
+
+`config.json` holds the real settings for Hub, Nacelle, Tower_Top and Tower_Bot, derived from the
+Logger programs (see its `_comment` entries for what was and was not verified). Raw files are
+searched under each Logger's `folder` and all subfolders (year and `Week_NN`), skipping `Card`
+folders and names that do not match `file_pattern`. A Logger can list `channel_mappings`
+(`from`/`to` dates, inclusive, read from the Raw file name, plus `channels`) instead of a single
+`channels` list; a file is mapped by its date and its column count, otherwise it is skipped and
+listed in `result.skipped`. `raw_folder` may be `None` to use the Logger's `folder`.
+
 ## Tests
 
 ```

@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Real stage 1 config for the four Loggers, derived from the Logger programs in M:/0373-03/Logger_Data/Logger_Programs.",
+    "Keys starting with an underscore are comments and are ignored.",
+    "Raw files are found under each Logger's folder and all its subfolders (year and Week_NN folders); Card folders are never read.",
+    "A Raw file is mapped by the date in its name (Logger clock, inclusive ranges) and its column count; files that match no mapping are skipped and listed in the result.",
+    "VERIFIED (2026-11-02): all four programs (Hub_2020_09_04_005/006, Nacelle_2020_09_04_008 and Nacelle_2021_08_24_009, Tow_Bot_2020_09_04_009, Tow_Top_2020_09_04_006) call NetworkTimeProtocol(\"10.0.0.4\", -4, 10) in a 24 h SlowSequence, so every Logger clock is UTC-4 (ADR 0002), including Nacelle and Tower_Top.",
+    "NOT VERIFIED: the clock offset was checked in the programs only, not against current-year files (no Nacelle, Tower_Top or Tower_Bot files exist under the 2026 folders at the time of writing; Hub 2026 files were not compared with an external clock).",
+    "NOT VERIFIED: the exact dates where a Logger program changed. Hub 12 -> 15 channels and Nacelle 15 -> 12 channels are dated from the program file dates (Hub_..._006 saved 2021-08-23, Nacelle_..._009 saved 2021-08-24); a Raw file in the gap fails the column-count check and is skipped and listed.",
+    "NOT VERIFIED: programs 001-004 (Aug-Sep 2020) of every Logger were not read; Raw files before 2020-09-04 are unmapped and would be skipped.",
+    "Units are taken from the Units lines of the programs; Nacelle Pitch_Speed (2020 program) has no Units line, mV is assumed."
+  ],
+  "output_folder": "output/summaries",
+  "loggers": {
+    "Hub": {
+      "folder": "M:/0373-03/Logger_Data/Hub",
+      "file_pattern": "hub_data_*.csv",
+      "clock_offset_hours": -4,
+      "channel_mappings": [
+        {
+          "_comment": "Program Hub_2020_09_04_005: 12 blade bridges, 12 columns after the 5 meta columns (confirmed on Hub_Data_2020_09_04_1823.csv).",
+          "from": "2020-09-04",
+          "to": "2021-08-22",
+          "channels": [
+            {"name": "B1_Root_Edge", "unit": "mV/V"},
+            {"name": "B1_Root_Flap", "unit": "mV/V"},
+            {"name": "B1_Mid_Edge", "unit": "mV/V"},
+            {"name": "B1_Mid_Flap", "unit": "mV/V"},
+            {"name": "B2_Root_Edge", "unit": "mV/V"},
+            {"name": "B2_Root_Flap", "unit": "mV/V"},
+            {"name": "B2_Mid_Edge", "unit": "mV/V"},
+            {"name": "B2_Mid_Flap", "unit": "mV/V"},
+            {"name": "B3_Root_Edge", "unit": "mV/V"},
+            {"name": "B3_Root_Flap", "unit": "mV/V"},
+            {"name": "B3_Mid_Edge", "unit": "mV/V"},
+            {"name": "B3_Mid_Flap", "unit": "mV/V"}
+          ]
+        },
+        {
+          "_comment": "Program Hub_2020_09_04_006 (latest): 12 blade bridges plus 3 azimuth accelerometer channels = 15 (confirmed on hub_data_2025_08_17_0009.csv).",
+          "from": "2021-08-23",
+          "channels": [
+            {"name": "B1_Root_Edge", "unit": "mV/V"},
+            {"name": "B1_Root_Flap", "unit": "mV/V"},
+            {"name": "B1_Mid_Edge", "unit": "mV/V"},
+            {"name": "B1_Mid_Flap", "unit": "mV/V"},
+            {"name": "B2_Root_Edge", "unit": "mV/V"},
+            {"name": "B2_Root_Flap", "unit": "mV/V"},
+            {"name": "B2_Mid_Edge", "unit": "mV/V"},
+            {"name": "B2_Mid_Flap", "unit": "mV/V"},
+            {"name": "B3_Root_Edge", "unit": "mV/V"},
+            {"name": "B3_Root_Flap", "unit": "mV/V"},
+            {"name": "B3_Mid_Edge", "unit": "mV/V"},
+            {"name": "B3_Mid_Flap", "unit": "mV/V"},
+            {"name": "Rot_Az_X", "unit": "mV"},
+            {"name": "Rot_Az_Y", "unit": "mV"},
+            {"name": "Rot_Az_Z", "unit": "mV"}
+          ]
+        }
+      ]
+    },
+    "Nacelle": {
+      "folder": "M:/0373-03/Logger_Data/Nacelle",
+      "file_pattern": "nacelle_data_*.csv",
+      "clock_offset_hours": -4,
+      "channel_mappings": [
+        {
+          "_comment": "Program Nacelle_2020_09_04_008: 15 channels (confirmed on nacelle_data_2020_09_04_1823.csv). Pitch_Speed has no Units line in the program.",
+          "from": "2020-09-04",
+          "to": "2021-08-23",
+          "channels": [
+            {"name": "Main_Shaft_Bend_00", "unit": "mV"},
+            {"name": "Main_Shaft_Bend_90", "unit": "mV"},
+            {"name": "Main_Shaft_Tor", "unit": "mV"},
+            {"name": "Tow_Top_Acc_X", "unit": "mV"},
+            {"name": "Tow_Top_Acc_Y", "unit": "mV"},
+            {"name": "Tow_Top_Acc_Z", "unit": "mV"},
+            {"name": "Active_Power", "unit": "mV"},
+            {"name": "Rot_Speed", "unit": "mV"},
+            {"name": "Yaw_Misalign", "unit": "mV"},
+            {"name": "Rot_Azimuth", "unit": "mV"},
+            {"name": "Pitch_Pos", "unit": "mV"},
+            {"name": "Pitch_Speed", "unit": "mV"},
+            {"name": "Brake_Status", "unit": "mV"},
+            {"name": "Turbine_Status", "unit": "mV"},
+            {"name": "Pitch_Act_Load", "unit": "mV"}
+          ]
+        },
+        {
+          "_comment": "Program Nacelle_2021_08_24_009 (latest): 12 channels. The card file nacelle_data.csv (TOA5 header) does not match the name pattern and is ignored.",
+          "from": "2021-08-24",
+          "channels": [
+            {"name": "Tow_Top_Acc_X", "unit": "mV"},
+            {"name": "Tow_Top_Acc_Y", "unit": "mV"},
+            {"name": "Tow_Top_Acc_Z", "unit": "mV"},
+            {"name": "Main_Shaft_Bend_00", "unit": "mV"},
+            {"name": "Main_Shaft_Bend_90", "unit": "mV"},
+            {"name": "Main_Shaft_Tor", "unit": "mV"},
+            {"name": "Wind_Direction", "unit": "mV"},
+            {"name": "Yaw_Position", "unit": "mV"},
+            {"name": "Active_Power", "unit": "mV"},
+            {"name": "Wind_Speed", "unit": "mV"},
+            {"name": "Pitch_Position", "unit": "mV"},
+            {"name": "Generator_Speed", "unit": "mV"}
+          ]
+        }
+      ]
+    },
+    "Tower_Top": {
+      "folder": "M:/0373-03/Logger_Data/Tower_Top",
+      "file_pattern": "tow_top_data_*.csv",
+      "clock_offset_hours": -4,
+      "_comment": "Program Tow_Top_2020_09_04_006 (latest): 3 channels (confirmed on tow_top_data_2020_09_04_1823.csv). Earlier programs 001-005 not read.",
+      "channels": [
+        {"name": "Tow_Top_Bend_00", "unit": "mV/V"},
+        {"name": "Tow_Top_Bend_90", "unit": "mV/V"},
+        {"name": "Tow_Top_Tor", "unit": "mV/V"}
+      ]
+    },
+    "Tower_Bot": {
+      "folder": "M:/0373-03/Logger_Data/Tower_Bottom",
+      "file_pattern": "tow_bot_*.csv",
+      "clock_offset_hours": -4,
+      "_comment": "Program Tow_Bot_2020_09_04_009 (latest): 2 channels (confirmed on tow_bot_2020_09_04_1823.csv and tow_bot_2021_*.csv). The data folder is Tower_Bottom, the programs folder is Tower_Bot.",
+      "channels": [
+        {"name": "Tow_Bot_Bend_00", "unit": "mV/V"},
+        {"name": "Tow_Bot_Bend_90", "unit": "mV/V"}
+      ]
+    }
+  }
+}
