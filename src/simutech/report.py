@@ -7,7 +7,10 @@ Report data (plain dict, the thing tests assert on):
     n_samples       50 Hz samples per Channel kept after duplicate resolution
     skipped_files   names of Raw files that matched no mapping
     channels        {channel: {
-        missing_share      share of the Channel's samples that were -7999
+        missing_share      share of the Channel's samples that were -7999, over the Raw files
+                           that carry the Channel; always within 0..1
+        counts_consistent  False if the Summary holds more valid samples than the sample
+                           counts cover (counts lost); missing_share is then unreliable
         full_second_share  share of Summary seconds with a full 50 samples
         stuck_seconds      Summary seconds flagged stuck
         clipped_samples    sum of n_clipped
@@ -32,46 +35,63 @@ STATS = ("mean", "ac_rms", "min", "max", "std")
 _DAILY_AGG = {"mean": "mean", "ac_rms": "mean", "std": "mean", "min": "min", "max": "max"}
 
 
-def build_report_data(logger: str, out_dir: Path, kept_rows: dict[str, int],
-                      checkpoint: dict, skipped: list[Path]) -> dict:
+def build_report_data(logger: str, out_dir: Path, checkpoint: dict, skipped: list[Path]) -> dict:
     """Report data over every Summary file of the Logger in `out_dir`.
 
-    `kept_rows` maps the Raw files condensed this run to their kept 50 Hz rows. Row
-    counts are persisted in a sidecar so the -7999 share stays cumulative across
-    incremental runs (entries for files no longer in `checkpoint` are dropped).
-    Duplicate seconds spanning two separate runs make that share slightly pessimistic.
+    The sample counts come from the sidecar written by `record_samples`, restricted to the
+    Raw files in `checkpoint`; they are cumulative across incremental runs. Duplicate seconds
+    spanning two separate runs make the -7999 share slightly pessimistic.
     """
-    files = sorted(Path(out_dir).glob(f"{logger}_*.parquet"))
+    files = sorted(Path(out_dir).glob(f"{logger}_????-??-??.parquet"))
     summary = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True) if files else None
-    return _report_data(logger, summary, _sample_total(Path(out_dir), kept_rows, checkpoint),
-                        skipped)
+    return _report_data(logger, summary, _load_samples(Path(out_dir), checkpoint), skipped)
 
 
-def _sample_total(out_dir: Path, kept_rows: dict[str, int], checkpoint: dict) -> int:
-    path = out_dir / SAMPLES_FILE
-    try:
-        counts = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        counts = {}
-    counts.update(kept_rows)
+def record_samples(out_dir: Path, kept: dict[str, dict], checkpoint: dict) -> None:
+    """Persist the kept 50 Hz row counts of Raw files condensed this batch.
+
+    `kept` maps a checkpoint key to {"rows": kept rows, "valid": {channel: valid samples}}.
+    Entries of files no longer in `checkpoint` are dropped.
+    """
+    counts = _read_samples(out_dir)
+    counts.update(kept)
     counts = {k: v for k, v in counts.items() if k in checkpoint}
-    if kept_rows:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
-    return sum(counts.values())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / SAMPLES_FILE
+    tmp = path.with_name(SAMPLES_FILE + ".tmp")
+    tmp.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
 
 
-def _report_data(logger: str, summary: pd.DataFrame | None, n_samples: int,
+def _read_samples(out_dir: Path) -> dict:
+    try:
+        counts = json.loads((out_dir / SAMPLES_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return {k: v for k, v in counts.items() if isinstance(v, dict)}  # older int-only format dropped
+
+
+def _load_samples(out_dir: Path, checkpoint: dict) -> dict:
+    return {k: v for k, v in _read_samples(out_dir).items() if k in checkpoint}
+
+
+def _report_data(logger: str, summary: pd.DataFrame | None, samples: dict,
                  skipped: list[Path]) -> dict:
-    data = {"logger": logger, "n_samples": int(n_samples),
+    data = {"logger": logger, "n_samples": int(sum(v["rows"] for v in samples.values())),
             "skipped_files": [p.name for p in skipped], "channels": {}}
     if summary is None or summary.empty:
         return data
     day = summary["timestamp_utc"].dt.strftime("%Y-%m-%d")
     for name, rows in summary.groupby("channel", sort=False):
         daily = rows.groupby(day[rows.index]).agg(_DAILY_AGG)
+        # same data on both sides: the Raw files that carry this Channel
+        n_rows = sum(v["rows"] for v in samples.values() if name in v["valid"])
+        n_ok = sum(v["valid"][name] for v in samples.values() if name in v["valid"])
+        in_summary = int(rows["n_valid"].sum())
         data["channels"][name] = {
-            "missing_share": 1 - float(rows["n_valid"].sum()) / n_samples if n_samples else 0.0,
+            "missing_share": min(1.0, max(0.0, 1 - n_ok / n_rows)) if n_rows else 0.0,
+            # False when the Summary holds more valid samples than the counts cover
+            "counts_consistent": bool(n_rows) and in_summary <= n_ok,
             "full_second_share": float((rows["n_valid"] == FULL_SECOND).mean()),
             "stuck_seconds": int(rows["stuck"].sum()),
             "clipped_samples": int(rows["n_clipped"].sum()),
@@ -91,7 +111,7 @@ def render_html(data: dict) -> str:
     esc = html.escape
     rows = "".join(
         f"<tr><td>{esc(n)}</td><td>{c['full_second_share']:.1%}</td>"
-        f"<td>{c['missing_share']:.2%}</td><td>{c['stuck_seconds']}</td>"
+        f"<td>{c['missing_share']:.2%}{'' if c['counts_consistent'] else ' (counts incomplete)'}</td><td>{c['stuck_seconds']}</td>"
         f"<td>{c['clipped_samples']} ({c['clipped_seconds']} s)</td></tr>"
         for n, c in data["channels"].items())
     charts = "".join(

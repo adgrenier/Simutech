@@ -14,7 +14,7 @@ Settings (per Logger, else top level, else default):
 
 Band RMS: each band is a continuous Butterworth band-pass filter over the 50 Hz samples.
 Its state is carried across seconds, across Raw files and across incremental runs
-(`bandstate.npz` next to the Summary files). It starts from the steady state of the first
+(`bandstate-<id>.npz` next to the Summary files; the checkpoint names the current one). It starts from the steady state of the first
 sample, so a constant offset gives no output. The Summary column `band_<name>_rms` of
 second t is the RMS of the filtered samples of seconds t-window+1 .. t of the same
 continuous stretch, so a stretch's first seconds use a shorter window and the filter is
@@ -33,7 +33,9 @@ Dominant frequency: `dominant_<Logger>.parquet`, one row per UTC-aligned 10-minu
     n_valid           int64    valid samples in the window (of 30000)
 
 Windows with fewer than `dominant_min_valid_fraction` (default 0.5) valid samples are not
-written. A window still open at the end of a run is kept in `bandstate.npz`.
+written. A window already written is replaced only by one with at least as many valid samples (a
+late partial file never degrades it). A window still open at the end of a run is kept in the band
+state file.
 """
 from __future__ import annotations
 

@@ -18,7 +18,10 @@ documented in the docstring of `src/simutech/condense.py`.
 
 Each run also writes a self-contained quality report, `<output_folder>/<Logger>/<Logger>_report.html`
 (daily trends, full-second share, -7999 share, stuck and clipping counts, skipped files). Its
-data is returned as `result.report` and documented in `src/simutech/report.py`.
+data is returned as `result.report` and documented in `src/simutech/report.py`. The -7999 share is
+per Channel, from sample counts kept in `report_samples.json` (per Raw file and Channel, written
+with each batch); it stays within 0..100 % and `counts_consistent` is false if the counts do not
+cover the Summary files (for instance after deleting that file).
 
 ### All four Loggers
 
@@ -73,12 +76,21 @@ Prints one progress line per Raw file and a summary per Logger; exits 1 if a fil
 or with `--refresh-listing`. `workers` (default 8) reads Raw files in parallel. Moving
 `start_date` earlier only adds the Raw files (and first seconds) the old start date cut.
 
+Raw files are condensed in batches (`batch_files`, default 144, per Logger or top level), so only one
+batch is in memory at a time; band state is carried between batches and the output equals an
+unbatched run. Every batch ends with a commit: Summary and dominant files are written through
+temporary files, the band state goes to a new `bandstate-<id>.npz`, and the checkpoint, which names
+that state file, is written last. A crash before the checkpoint write leaves the previous checkpoint
+and band state, and the rerun gives the same output as a clean run; finished batches are kept.
+A Summary second delivered again replaces only the rows of the Channels it contains. A dominant
+window already written is kept if a later file only fills it partly.
+
 ### Band-limited RMS and dominant frequency
 
 Channels may carry `"bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, ...]` in the config
 (see `config.json`; edges confirmed by the owner, see `docs/research/band-proposal-tower-fft.md`).
 Each band adds a Summary column `band_<name>_rms`: the RMS of a continuous Butterworth band-pass
-filter (state carried across seconds, Raw files and incremental runs in `bandstate.npz`, reset after
+filter (state carried across seconds, Raw files and incremental runs in `bandstate-<id>.npz`, reset after
 a gap or -7999 stretch longer than `band_reset_gap_seconds`, default 1) over a rolling
 `band_window_seconds` window (default 10), published once per UTC second. Each Channel with bands
 also gets one row per UTC-aligned 10-minute window in `dominant_<Logger>.parquet`
@@ -91,6 +103,8 @@ in `src/simutech/bands.py`. Needs `scipy`.
 (default: all in the config) and writes `<output_folder>/comparison.html`: every Logger's data
 health and daily-mean trend side by side, linking to each Logger's own report. Its data is
 returned by `simutech.compare.compare(...).data` and documented in `src/simutech/compare.py`.
+Like `python -m simutech` it covers the last 90 days by default (`--start-date YYYY-MM-DD`, or
+`start_date` in the config, to change it) and prints one progress line per Raw file.
 
 ## Tests
 

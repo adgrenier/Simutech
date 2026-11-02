@@ -24,7 +24,7 @@ def make(tmp_path):
 
 
 def test_comparison_data_puts_loggers_side_by_side(tmp_path):
-    data = compare(make(tmp_path)).data
+    data = compare(make(tmp_path), start_date="2026-01-01").data
     assert list(data["loggers"]) == ["Hub", "Nacelle"]
     hub, nac = data["loggers"]["Hub"], data["loggers"]["Nacelle"]
     assert hub["full_second_share"] == 1.0 and hub["missing_share"] == 0.0
@@ -38,7 +38,7 @@ def test_comparison_data_puts_loggers_side_by_side(tmp_path):
 
 
 def test_page_is_self_contained_and_links_each_logger_report(tmp_path):
-    result = compare(make(tmp_path))
+    result = compare(make(tmp_path), start_date="2026-01-01")
     page = result.page_file.read_text(encoding="utf-8")
     assert result.page_file == tmp_path / "out" / "comparison.html"
     assert 'href="Hub/Hub_report.html"' in page and 'href="Nacelle/Nacelle_report.html"' in page
@@ -47,5 +47,5 @@ def test_page_is_self_contained_and_links_each_logger_report(tmp_path):
 
 
 def test_logger_subset(tmp_path):
-    data = compare(make(tmp_path), loggers=["Hub"]).data
+    data = compare(make(tmp_path), loggers=["Hub"], start_date="2026-01-01").data
     assert list(data["loggers"]) == ["Hub"]

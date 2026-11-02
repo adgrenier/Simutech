@@ -16,9 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-from .condense import condense
-
-DEFAULT_WINDOW_DAYS = 90
+from .condense import condense, window_start
 
 
 def main(argv=None, today: datetime.date | None = None) -> int:
@@ -34,9 +32,7 @@ def main(argv=None, today: datetime.date | None = None) -> int:
     loggers = args.logger or list(config["loggers"])
     if args.raw_folder and len(loggers) != 1:
         ap.error("--raw-folder needs exactly one --logger")
-    today = today or datetime.date.today()
-    start = (args.start_date or config.get("start_date")
-             or str(today - datetime.timedelta(days=DEFAULT_WINDOW_DAYS)))
+    start = window_start(config, args.start_date, today)
     print(f"Window starts {start} (UTC); Loggers: {', '.join(loggers)}", flush=True)
 
     failures = 0

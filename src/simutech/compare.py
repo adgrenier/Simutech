@@ -15,18 +15,19 @@ Comparison data (plain dict, the thing tests assert on):
         report_link       the Logger's report path relative to the comparison page
     }}
 
-Run: `python -m simutech.compare config.json [Logger ...]`
+Run: `python -m simutech.compare config.json [--start-date YYYY-MM-DD] [Logger ...]`
+The window defaults to the last 90 days, like `python -m simutech`.
 """
 from __future__ import annotations
 
+import argparse
 import html
 import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .condense import condense
+from .condense import condense, window_start
 
 PAGE_NAME = "comparison.html"
 
@@ -37,14 +38,20 @@ class ComparisonResult:
     page_file: Path
 
 
-def compare(config, loggers: list[str] | None = None, raw_folders: dict | None = None) -> ComparisonResult:
+def compare(config, loggers: list[str] | None = None, raw_folders: dict | None = None,
+            start_date=None, today=None, progress=None) -> ComparisonResult:
     """Run the condense run for each Logger (default: all in the config) and write
-    `<output_folder>/comparison.html`. `raw_folders` optionally maps Logger -> raw folder."""
+    `<output_folder>/comparison.html`. `raw_folders` optionally maps Logger -> raw folder.
+
+    The window is the command line's: from `start_date`, else the config's `start_date`, else
+    90 days before `today` (default: today). `progress` gets one line per Raw file."""
     if not isinstance(config, dict):
         config = json.loads(Path(config).read_text(encoding="utf-8"))
     out = Path(config["output_folder"])
     names = loggers or list(config["loggers"])
-    results = {n: condense(config, (raw_folders or {}).get(n), n) for n in names}
+    start = window_start(config, start_date, today)
+    results = {n: condense(config, (raw_folders or {}).get(n), n, start_date=start, progress=progress)
+               for n in names}
     data = {"loggers": {n: _logger(r, out) for n, r in results.items()}}
     out.mkdir(parents=True, exist_ok=True)
     page = out / PAGE_NAME
@@ -112,10 +119,13 @@ td:first-child,th:first-child{{text-align:left}}</style></head><body>
 
 
 def main(argv: list[str] | None = None) -> None:
-    argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        raise SystemExit("usage: python -m simutech.compare config.json [Logger ...]")
-    print(compare(argv[0], argv[1:] or None).page_file)
+    ap = argparse.ArgumentParser(prog="simutech.compare")
+    ap.add_argument("config")
+    ap.add_argument("loggers", nargs="*")
+    ap.add_argument("--start-date", help="first UTC day (default: config start_date, else 90 days back)")
+    args = ap.parse_args(argv)
+    print(compare(args.config, args.loggers or None, start_date=args.start_date,
+                  progress=lambda m: print("  " + m, flush=True)).page_file)
 
 
 if __name__ == "__main__":

@@ -38,11 +38,15 @@ Config settings (per Logger, else top level, else default):
 """
 from __future__ import annotations
 
+import csv
+import datetime
 import fnmatch
+import io
 import json
 import os
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 from . import bands as _bands
-from .report import build_report_data, write_report
+from .report import build_report_data, record_samples, write_report
 
 MISSING = -7999
 CARD_FOLDER = "card"  # copy of the Logger's memory card, never read
@@ -84,6 +88,13 @@ class CondenseResult:
                 "failed": len(self.failed)}
 
 
+def window_start(config: dict, start_date=None, today: datetime.date | None = None) -> str:
+    """First UTC day of a run window: `start_date`, else the config's `start_date`, else
+    `DEFAULT_WINDOW_DAYS` days before `today`. Shared by the command line and `compare`."""
+    return str(start_date or config.get("start_date")
+               or (today or datetime.date.today()) - datetime.timedelta(days=DEFAULT_WINDOW_DAYS))
+
+
 def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: bool = False,
              progress=None) -> CondenseResult:
     """Condense one Logger's Raw files into Summary files.
@@ -114,6 +125,13 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
     added since are only seen after it expires or with `refresh_listing=True`. Moving
     `start_date` earlier only adds the files (and seconds) the old start date cut.
     `progress`, if given, is called with one line of text per Raw file read.
+
+    Raw files are condensed in batches of `batch_files` (per Logger, else top level, default
+    144) so a long backlog never sits in memory at once; band state is carried from batch to
+    batch and the result equals an unbatched run for files that arrive in time order. Each
+    batch ends with a commit whose last step is the checkpoint write (it also names the band
+    state file `bandstate-<id>.npz` that goes with it): a crash earlier in a batch leaves the
+    previous checkpoint and band state in place and a rerun gives the same output as a clean run.
     """
     if not isinstance(config, dict):
         config = json.loads(Path(config).read_text(encoding="utf-8"))
@@ -129,12 +147,11 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
 
     out_dir = Path(config["output_folder"]) / logger
     checkpoint_path = out_dir / CHECKPOINT
-    checkpoint, saved_start, cut = _load_checkpoint(checkpoint_path)
+    checkpoint, saved_start, cut, band_file = _load_checkpoint(checkpoint_path)
     if saved_start is not None and (start is None or start < saved_start):
         for key in cut:  # start date moved earlier: redo only the files the old one cut into
             checkpoint.pop(key, None)
         cut = set()
-    now = time.time()
 
     result = CondenseResult()
     root = Path(raw_folder if raw_folder is not None else cfg["folder"])
@@ -153,62 +170,105 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
             todo.append((key, path, entry))
 
     workers = max(1, int(cfg.get("workers", config.get("workers", DEFAULT_WORKERS))))
+    batch_size = max(1, int(cfg.get("batch_files", config.get("batch_files", DEFAULT_BATCH_FILES))))
     now = time.time()
 
     def load(item):  # runs in a worker thread: the slow part is reading the share
         _, path, entry = item
         try:
-            if now - entry[1] / 1e9 < settle or _incomplete(path):
+            if now - entry[1] / 1e9 < settle:
                 return "pending", None
-            return "ok", _read_raw(path, offset - toa5_offset)
+            data = path.read_bytes()  # the only read of the file
+            if _incomplete(data):
+                return "pending", None
+            return "ok", _read_raw(data, offset - toa5_offset)
         except Exception as exc:  # one bad file must not stop the run
             return "failed", f"{type(exc).__name__}: {exc}"
-
-    frames: list[list[pd.DataFrame]] = [[] for _ in mappings]  # per mapping
-    n_files, new_entries, keys = 0, {}, []  # keys[i]: checkpoint key of file number i
-    new_cut = set(cut)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for n_read, ((key, path, entry), (status, df)) in enumerate(zip(todo, pool.map(load, todo)), 1):
-            if progress is not None:
-                progress(f"{logger}: file {n_read}/{len(todo)} {key}")
-            if status == "pending":
-                result.pending.append(path)
-                continue
-            if status == "failed":
-                result.failed.append((path, df))
-                continue
-            df, header = df
-            match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META, header)
-            if match is None:
-                result.skipped.append(path)
-                continue
-            new_cut.discard(key)
-            if start is not None:
-                utc = _second_starts(df) - offset
-                if utc.max() < start:
-                    continue  # wholly before the start date: left out, not checkpointed
-                if utc.min() < start:
-                    new_cut.add(key)  # partly cut: redone if the start date moves earlier
-            frames[match].append(df.assign(_file=n_files))
-            keys.append(key)
-            n_files += 1
-            result.processed.append(path)
-            new_entries[key] = entry
 
     stuck_window = cfg.get("stuck_window_seconds",
                            config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
     clip = cfg.get("clipping_threshold", config.get("clipping_threshold", DEFAULT_CLIPPING_THRESHOLD))
-    summaries = []
     bands_by_channel = _bands_by_channel(cfg)
     band_settings = _bands.BandSettings(cfg, config)
-    band_state_path = out_dir / _bands.STATE_FILE
-    band_state = _bands.load_state(band_state_path) if bands_by_channel else {}
-    dominant_rows: list[dict] = []
-    kept_rows: dict[str, int] = {}  # checkpoint key -> kept 50 Hz rows, this run
+    band_state = {}
+    if bands_by_channel:
+        band_state = _bands.load_state(out_dir / (band_file or _bands.STATE_FILE))
+    new_cut = set(cut)
+    summary_files: set[Path] = set()
+    n_read = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for lo in range(0, len(todo), batch_size):  # one batch in memory at a time
+            chunk = todo[lo:lo + batch_size]
+            frames: list[list[pd.DataFrame]] = [[] for _ in mappings]  # per mapping
+            keys, new_entries = [], {}  # keys[i]: checkpoint key of file number i of this batch
+            for (key, path, entry), (status, df) in zip(chunk, pool.map(load, chunk)):
+                n_read += 1
+                if progress is not None:
+                    progress(f"{logger}: file {n_read}/{len(todo)} {key}")
+                if status == "pending":
+                    result.pending.append(path)
+                    continue
+                if status == "failed":
+                    result.failed.append((path, df))
+                    continue
+                df, header = df
+                match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META, header)
+                if match is None:
+                    result.skipped.append(path)
+                    continue
+                new_cut.discard(key)
+                if start is not None:
+                    utc = _second_starts(df) - offset
+                    if utc.max() < start:
+                        continue  # wholly before the start date: left out, not checkpointed
+                    if utc.min() < start:
+                        new_cut.add(key)  # partly cut: redone if the start date moves earlier
+                frames[match].append(df.assign(_file=len(keys)))
+                keys.append(key)
+                result.processed.append(path)
+                new_entries[key] = entry
+            if not new_entries:
+                continue
+            summaries, dominant_rows, kept = _condense_batch(
+                frames, keys, mappings, offset, start, stuck_window, clip, bands_by_channel,
+                band_settings, band_state)
+            # Commit. Day files and the dominant file are replaced by key, so redoing them
+            # after a crash gives the same rows; the band state goes to a new file; the
+            # checkpoint, which names that state file, is written last and is the commit point.
+            if summaries:
+                summary_files.update(_merge_into_days(out_dir, logger, pd.concat(summaries, ignore_index=True),
+                                                      stuck_window))
+            if dominant_rows:
+                _merge_dominant(out_dir / f"dominant_{logger}.parquet", dominant_rows)
+            new_band_file = None
+            if bands_by_channel:
+                new_band_file = f"bandstate-{uuid.uuid4().hex[:12]}.npz"
+                _bands.save_state(out_dir / new_band_file, band_state)
+            checkpoint = {**checkpoint, **new_entries}
+            record_samples(out_dir, kept, checkpoint)
+            _save_checkpoint(checkpoint_path, checkpoint, start, new_cut, new_band_file)
+            if bands_by_channel:
+                for old in out_dir.glob("bandstate*.npz"):
+                    if old.name != new_band_file:
+                        old.unlink(missing_ok=True)
+    result.summary_files = sorted(summary_files)
+    result.report = build_report_data(logger, out_dir, checkpoint, result.skipped)
+    result.report_file = write_report(result.report, out_dir / f"{logger}_report.html")
+    return result
+
+
+def _condense_batch(frames, keys, mappings, offset, start, stuck_window, clip, bands_by_channel,
+                    band_settings, band_state):
+    """Summary frames, closed dominant rows and kept sample counts of one batch of Raw files.
+    Updates `band_state`."""
+    summaries, dominant_rows = [], []
+    kept: dict[str, dict] = {}  # checkpoint key -> {"rows": kept 50 Hz rows, "valid": {channel: n}}
     for (_, _, names, _), group in zip(mappings, frames):
         if not group:
             continue
         raw = pd.concat(group, ignore_index=True)
+        for i in raw["_file"].unique():
+            kept[keys[i]] = {"rows": 0, "valid": {n: 0 for n in names}}
         stamps = _second_starts(raw) - offset  # logger clock -> UTC
         # duplicate seconds across files: keep only the later file's rows
         latest = raw["_file"].groupby(stamps).transform("max")
@@ -216,28 +276,21 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
         if start is not None:
             keep &= (stamps >= start).to_numpy()
         raw, stamps = raw[keep], stamps[keep]
+        if not len(raw):
+            continue
+        values = raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1)
+        usable = values.notna() & (values != MISSING)
+        valid = usable.groupby(raw["_file"].to_numpy()).sum()
         for i, n in raw.groupby("_file").size().items():
-            kept_rows[keys[i]] = int(n)
-        if len(raw):
-            values = raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1)
-            summary = _summarise(values, stamps, stuck_window, clip)
-            if bands_by_channel:
-                times = _epoch_ms(_sample_times(raw) - offset)
-                summary = _add_bands(summary, values, times, bands_by_channel, band_settings,
-                                     band_state, dominant_rows)
-            summaries.append(summary)
-    if summaries:
-        result.summary_files = _merge_into_days(out_dir, logger, pd.concat(summaries, ignore_index=True),
-                                                stuck_window)
-    if bands_by_channel and summaries:
-        _bands.save_state(band_state_path, band_state)
-        _merge_dominant(out_dir / f"dominant_{logger}.parquet", dominant_rows)
-    if new_entries:
-        checkpoint.update(new_entries)
-        _save_checkpoint(checkpoint_path, checkpoint, start, new_cut)
-    result.report = build_report_data(logger, out_dir, kept_rows, checkpoint, result.skipped)
-    result.report_file = write_report(result.report, out_dir / f"{logger}_report.html")
-    return result
+            kept[keys[i]]["rows"] = int(n)
+            kept[keys[i]]["valid"] = {c: int(valid.loc[i, c]) for c in names}
+        summary = _summarise(values, stamps, stuck_window, clip)
+        if bands_by_channel:
+            times = _epoch_ms(_sample_times(raw) - offset)
+            summary = _add_bands(summary, values, times, bands_by_channel, band_settings,
+                                 band_state, dominant_rows)
+        summaries.append(summary)
+    return summaries, dominant_rows, kept
 
 
 def _mappings(cfg) -> list[tuple]:
@@ -278,27 +331,37 @@ def _add_bands(summary, values, times, bands_by_channel, settings, state, domina
                                            settings, state)
         dominant_rows += rows
         if len(out):
-            out = out.set_index(out["timestamp_utc"].astype(summary.index.levels[0].dtype))
-            for col in out.columns[1:]:
-                idx = pd.MultiIndex.from_arrays([out.index, [name] * len(out)])
-                summary.loc[idx.intersection(summary.index), col] = out[col].to_numpy()[
-                    idx.isin(summary.index)]
+            stamps = out["timestamp_utc"].astype(summary.index.levels[0].dtype)
+            out.index = pd.MultiIndex.from_arrays([stamps, [name] * len(out)],
+                                                  names=["timestamp_utc", "channel"])
+            summary.update(out.drop(columns="timestamp_utc"))  # aligned on (second, Channel)
     return summary.reset_index()
 
 
 def _merge_dominant(path: Path, rows: list[dict]) -> None:
-    if not rows:
-        return
+    """Add closed windows to the dominant file. A window already written is replaced only by
+    one with at least as many valid samples, so a late partial file never degrades it."""
     new = pd.DataFrame(rows)
     new["n_valid"] = new["n_valid"].astype("int64")
     if path.exists():
         old = pd.read_parquet(path)
-        keys = pd.MultiIndex.from_frame(new[["window_start_utc", "channel"]])
-        old = old[~pd.MultiIndex.from_frame(old[["window_start_utc", "channel"]]).isin(keys)]
+        cols = ["window_start_utc", "channel"]
+        have = old.set_index(cols)["n_valid"]
+        prior = have.reindex(pd.MultiIndex.from_frame(new[cols])).to_numpy()
+        new = new[~(new["n_valid"].to_numpy() < prior)]  # NaN prior (no old window): kept
+        new_keys = pd.MultiIndex.from_frame(new[cols])
+        old = old[~pd.MultiIndex.from_frame(old[cols]).isin(new_keys)]
         new = pd.concat([old, new], ignore_index=True)
     new = new.sort_values(["window_start_utc", "channel"], kind="stable").reset_index(drop=True)
+    _write_parquet(new, path)
+
+
+def _write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write via a temporary file so a crash never leaves a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    new.to_parquet(path, index=False)
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(path)
 
 
 def _file_date(path: Path) -> pd.Timestamp | None:
@@ -382,7 +445,8 @@ def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
            if (out_dir / f"{logger}_{d}.parquet").exists()]
     if old:
         old = pd.concat(old, ignore_index=True)
-        old = old[~old.timestamp_utc.isin(summary.timestamp_utc)]
+        replaced = pd.MultiIndex.from_frame(summary[["timestamp_utc", "channel"]])
+        old = old[~pd.MultiIndex.from_frame(old[["timestamp_utc", "channel"]]).isin(replaced)]
         summary = pd.concat([old, summary], ignore_index=True)
     summary = summary.sort_values(["channel", "timestamp_utc"], kind="stable")
     for _, idx in summary.groupby("channel", sort=False).groups.items():
@@ -395,7 +459,7 @@ def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
     for day, part in summary.groupby(summary.timestamp_utc.dt.strftime("%Y-%m-%d")):
         if day in touched:
             path = out_dir / f"{logger}_{day}.parquet"
-            part.reset_index(drop=True).to_parquet(path, index=False)
+            _write_parquet(part.reset_index(drop=True), path)
             written.append(path)
     return written
 
@@ -403,25 +467,29 @@ def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
 CHECKPOINT = "checkpoint.json"
 LISTING = "listing.json"
 DEFAULT_WORKERS = 8
+DEFAULT_BATCH_FILES = 144  # Raw files held in memory at once (one day of 10-minute files)
+DEFAULT_WINDOW_DAYS = 90
 _NAME_DATE = re.compile(r"(\d{4})_(\d{2})_(\d{2})")
 
 
-def _load_checkpoint(path: Path) -> tuple[dict, pd.Timestamp | None, set]:
-    """(files, start date of the last run, files that run cut into at the start date)."""
+def _load_checkpoint(path: Path) -> tuple[dict, pd.Timestamp | None, set, str | None]:
+    """(files, start date of the last run, files that run cut into at the start date, name of
+    the band state file that belongs to this checkpoint)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         saved = data.get("start_date")
-        return data["files"], pd.Timestamp(saved) if saved else None, set(data.get("cut", []))
+        return (data["files"], pd.Timestamp(saved) if saved else None, set(data.get("cut", [])),
+                data.get("band_state"))
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return {}, None, set()
+        return {}, None, set(), None
 
 
-def _save_checkpoint(path: Path, files: dict, start, cut: set) -> None:
+def _save_checkpoint(path: Path, files: dict, start, cut: set, band_state: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(
         {"start_date": str(start.date()) if start is not None else None, "files": files,
-         "cut": sorted(cut & files.keys())},
+         "cut": sorted(cut & files.keys()), "band_state": band_state},
         indent=0, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
@@ -432,40 +500,44 @@ def _name_date_before(name: str, day: pd.Timestamp) -> bool:
     return bool(m) and pd.Timestamp("-".join(m.groups())) < day
 
 
-def _incomplete(path: Path) -> bool:
+def _incomplete(data: bytes) -> bool:
     """True if the last row looks cut off: no final newline, or a different field
     count from the first row."""
-    data = path.read_bytes()
-    if not data.strip():
+    if not data or data.isspace():
         return False
     if not data.endswith(b"\n"):
         return True
-    lines = data.splitlines()
-    first = lines[1] if data.startswith(TOA5_MARK) and len(lines) > 1 else lines[0]  # TOA5: field names
-    return lines[-1].count(b",") != first.count(b",")
+    head = data.split(b"\n", 2)
+    first = head[1] if data.startswith(TOA5_MARK) and len(head) > 2 else head[0]  # TOA5: field names
+    end = len(data) - 1
+    last = data[data.rfind(b"\n", 0, end) + 1:end]
+    return last.rstrip(b"\r").count(b",") != first.rstrip(b"\r").count(b",")
 
 
-def _read_raw(path: Path, shift: pd.Timedelta = pd.Timedelta(0)):
-    """Parse a Raw file into (frame, header); (None, None) if it cannot be read.
+def _read_raw(source: Path | bytes, shift: pd.Timedelta = pd.Timedelta(0)):
+    """Parse a Raw file (its path or its bytes) into (frame, header); (None, None) if it
+    cannot be read.
 
     Headerless file: frame is the file as is, header None. TOA5 file (first line starts with
     "TOA5"): the TIMESTAMP column is split into the headerless layout (table id 0, year,
     day-of-year, HHMM, seconds) and moved by `shift` (headerless offset minus TOA5 offset) so
     that, once the headerless offset is subtracted, it is UTC; `NAN` becomes -7999; header is
     (Channel names, units) from the file. Raises ValueError on non-numeric content."""
-    with open(path, "rb") as f:
-        toa5 = f.read(len(TOA5_MARK)) == TOA5_MARK
+    data = source if isinstance(source, bytes) else Path(source).read_bytes()
     try:
-        if not toa5:
-            df = pd.read_csv(path, header=None)
+        if not data.startswith(TOA5_MARK):
+            df = pd.read_csv(io.BytesIO(data), header=None)
             return (None, None) if df.shape[1] <= N_META else (df.apply(pd.to_numeric), None)
-        head = pd.read_csv(path, header=None, nrows=3, skiprows=1, dtype=str, engine="python")
-        df = pd.read_csv(path, header=None, skiprows=TOA5_HEADER_ROWS, dtype=str, na_values=[], keep_default_na=False)
+        lines = data.split(b"\n", TOA5_HEADER_ROWS)[:TOA5_HEADER_ROWS]
+        if len(lines) < 3:
+            return None, None
+        names, units = (next(csv.reader([ln.decode("utf-8").rstrip("\r")]))[2:] for ln in lines[1:3])
+        df = pd.read_csv(io.BytesIO(data), header=None, skiprows=TOA5_HEADER_ROWS, dtype=str,
+                         na_values=[], keep_default_na=False)
     except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
         return None, None
     if df.shape[1] <= 2:
         return None, None
-    names, units = list(head.iloc[0, 2:]), list(head.iloc[1, 2:])
     stamps = pd.to_datetime(df.iloc[:, 0], format="ISO8601") + shift  # ValueError on bad text
     values = df.iloc[:, 2:].replace("NAN", str(MISSING)).apply(pd.to_numeric)
     ms = (stamps.dt.second * 1000 + stamps.dt.microsecond // 1000).to_numpy()
@@ -474,17 +546,6 @@ def _read_raw(path: Path, shift: pd.Timedelta = pd.Timedelta(0)):
     out = pd.concat([out, values.set_axis(range(5, 5 + values.shape[1]), axis=1)], axis=1)
     out.columns = range(out.shape[1])
     return out, (names, units)
-
-
-def _second_starts(raw: pd.DataFrame) -> pd.Series:
-    """Start of each row's whole second, on the Logger's own clock."""
-    year, doy, hhmm, sec = (raw.iloc[:, i] for i in (1, 2, 3, 4))
-    whole = np.round(sec.to_numpy() * 100).astype(np.int64) // 100  # 20 ms steps, exact
-    days = pd.to_timedelta(doy.to_numpy() - 1, unit="D")
-    clock = pd.to_timedelta((hhmm // 100).to_numpy(), unit="h") + pd.to_timedelta(
-        (hhmm % 100).to_numpy(), unit="min") + pd.to_timedelta(whole, unit="s")
-    jan1 = pd.to_datetime(year.astype(str) + "-01-01")
-    return pd.Series(jan1 + days + clock, index=raw.index)
 
 
 def _sample_times(raw: pd.DataFrame) -> pd.Series:
@@ -496,6 +557,11 @@ def _sample_times(raw: pd.DataFrame) -> pd.Series:
         (hhmm % 100).to_numpy(), unit="min") + pd.to_timedelta(ms, unit="ms")
     jan1 = pd.to_datetime(year.astype(str) + "-01-01")
     return pd.Series(jan1 + days + clock, index=raw.index)
+
+
+def _second_starts(raw: pd.DataFrame) -> pd.Series:
+    """Start of each row's whole second, on the Logger's own clock."""
+    return _sample_times(raw).dt.floor("s")
 
 
 def _summarise(values: pd.DataFrame, stamps: pd.Series, stuck_window: int,
