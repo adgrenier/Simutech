@@ -1,0 +1,14 @@
+{
+  "output_folder": "output/summaries",
+  "loggers": {
+    "Tower_Bot": {
+      "folder": "M:/0373-03/Logger_Data/Tower_Bottom",
+      "file_pattern": "tow_bot_*.csv",
+      "clock_offset_hours": -4,
+      "channels": [
+        {"name": "Tow_Bot_Bend_00", "unit": "mV/V"},
+        {"name": "Tow_Bot_Bend_90", "unit": "mV/V"}
+      ]
+    }
+  }
+}
