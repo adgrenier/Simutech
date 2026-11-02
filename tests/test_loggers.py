@@ -113,6 +113,7 @@ REAL_SHAPES = [
 def test_shipped_config_maps_all_four_loggers_with_utc_minus_4(tmp_path):
     cfg = json.loads((Path(__file__).parent.parent / "config.json").read_text(encoding="utf-8"))
     cfg["output_folder"] = str(tmp_path / "out")
+    cfg["listing_cache_hours"] = 0  # the test adds files between runs
     assert {n: c["clock_offset_hours"] for n, c in cfg["loggers"].items()} == {
         "Hub": -4, "Nacelle": -4, "Tower_Top": -4, "Tower_Bot": -4}
 

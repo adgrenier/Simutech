@@ -60,6 +60,13 @@ Prints one progress line per Raw file and a summary per Logger; exits 1 if a fil
 or with `--refresh-listing`. `workers` (default 8) reads Raw files in parallel. Moving
 `start_date` earlier only adds the Raw files (and first seconds) the old start date cut.
 
+### Cross-Logger comparison page
+
+`python -m simutech.compare config.json [Logger ...]` runs the condensing run for each Logger
+(default: all in the config) and writes `<output_folder>/comparison.html`: every Logger's data
+health and daily-mean trend side by side, linking to each Logger's own report. Its data is
+returned by `simutech.compare.compare(...).data` and documented in `src/simutech/compare.py`.
+
 ## Tests
 
 ```
