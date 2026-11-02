@@ -26,6 +26,22 @@ folders and names that do not match `file_pattern`. A Logger can list `channel_m
 `channels` list; a file is mapped by its date and its column count, otherwise it is skipped and
 listed in `result.skipped`. `raw_folder` may be `None` to use the Logger's `folder`.
 
+### Data health and incremental runs
+
+Optional data-health settings (per Logger or top level): `stuck_window_seconds` (default 5,
+consecutive zero-std seconds that set `stuck`) and `clipping_threshold` (default 7900, absolute
+value counted in `n_clipped`). Duplicate seconds across Raw files keep the later file's rows.
+
+Runs are incremental and idempotent. `<output_folder>/<Logger>/checkpoint.json` records the
+Raw files already condensed (name, size, modification time); later runs only process new or
+changed files and merge their Summaries into the daily files, so a rerun changes nothing.
+Optional settings: `start_date` (config top level, or `condense(..., start_date=...)`) ignores
+earlier Raw files and seconds; per-Logger `settle_seconds` (default 0) treats a Raw file
+modified more recently than that, or with an incomplete last row, as still being written
+(`result.pending`, retried next run). A file that cannot be parsed goes in `result.failed`
+and the run continues. `result.summary` holds the end-of-run counts. Moving `start_date`
+earlier redoes the files it previously cut.
+
 ## Tests
 
 ```
