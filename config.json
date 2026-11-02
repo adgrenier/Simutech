@@ -11,6 +11,8 @@
     "Units are taken from the Units lines of the programs; Nacelle Pitch_Speed (2020 program) has no Units line, mV is assumed."
   ],
   "output_folder": "output/summaries",
+  "listing_cache_hours": 24,
+  "workers": 8,
   "loggers": {
     "Hub": {
       "folder": "M:/0373-03/Logger_Data/Hub",

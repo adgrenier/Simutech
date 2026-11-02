@@ -46,6 +46,20 @@ modified more recently than that, or with an incomplete last row, as still being
 and the run continues. `result.summary` holds the end-of-run counts. Moving `start_date`
 earlier redoes the files it previously cut.
 
+### Backlog-scale run (all Loggers)
+
+```
+python -m simutech --config config.json                 # all Loggers, window = start_date or 90 days back
+python -m simutech --logger Tower_Bot --raw-folder SAMPLE_DIR --start-date 2026-03-10
+```
+
+Prints one progress line per Raw file and a summary per Logger; exits 1 if a file failed.
+`--refresh-listing` re-lists the Raw folders. Listing the storage server takes minutes, so
+`listing_cache_hours` (config.json: 24) keeps each Logger's file listing in
+`<output_folder>/<Logger>/listing.json`; files added after it was made appear once it expires
+or with `--refresh-listing`. `workers` (default 8) reads Raw files in parallel. Moving
+`start_date` earlier only adds the Raw files (and first seconds) the old start date cut.
+
 ## Tests
 
 ```

@@ -278,7 +278,8 @@ def test_start_date_ignores_earlier_files(tmp_path):
 
     # the start date can also be passed per call, and moving it earlier picks up the backlog
     result = condense(cfg, raw, "Tower_Bot", start_date="2026-03-01")
-    assert result.summary["processed"] == 2  # files cut by the old start date are redone
+    assert result.summary["processed"] == 1  # only the file cut by the old start date is added
+    assert result.summary["already_done"] == 1
     assert [p.name for p in out_files(tmp_path)] == ["Tower_Bot_2026-03-09.parquet",
                                                      "Tower_Bot_2026-03-10.parquet"]
 
@@ -337,3 +338,63 @@ def test_stuck_run_spanning_two_incremental_runs_is_flagged(tmp_path):
     write_raw(raw, "tow_bot_2026_03_10_0816.csv", pd.Timestamp("2026-03-10 08:15:02"), [[1.0, 1.0]] * 50)
     condense(cfg, raw, "Tower_Bot")
     assert read_day(tmp_path, "2026-03-10").stuck.all()
+
+
+def test_earlier_start_date_redoes_only_files_the_old_start_date_cut(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    # logger 19:59:59 on 03-10 is UTC 23:59:59: its first second is on 03-10, its second on 03-11
+    write_raw(raw, "tow_bot_2026_03_10_1959.csv", pd.Timestamp("2026-03-10 19:59:59"), [[1.0, 1.0]] * 100)
+    write_raw(raw, "tow_bot_2026_03_12_0815.csv", pd.Timestamp("2026-03-12 08:15:00"), [[2.0, 2.0]] * 50)
+    write_raw(raw, "tow_bot_2026_03_05_0815.csv", pd.Timestamp("2026-03-05 08:15:00"), [[3.0, 3.0]] * 50)
+    condense(cfg, raw, "Tower_Bot", start_date="2026-03-11")
+    assert len(read_day(tmp_path, "2026-03-11")) == 2  # one second of the spanning file + 03-12 file
+
+    result = condense(cfg, raw, "Tower_Bot", start_date="2026-03-10")
+    # the spanning file lost a second to the old cut and is redone; the 03-12 file is not
+    assert [p.name for p in result.processed] == ["tow_bot_2026_03_10_1959.csv"]
+    assert sorted(read_day(tmp_path, "2026-03-10").timestamp_utc) == [
+        pd.Timestamp("2026-03-10 23:59:59")] * 2
+
+    result = condense(cfg, raw, "Tower_Bot", start_date="2026-03-01")
+    assert [p.name for p in result.processed] == ["tow_bot_2026_03_05_0815.csv"]
+
+
+def test_parallel_processing_gives_the_same_output_as_serial(tmp_path):
+    def run(workers, out):
+        (tmp_path / out).mkdir()
+        raw, cfg = make_config(tmp_path / out)
+        cfg["loggers"]["Tower_Bot"]["workers"] = workers
+        for d in range(1, 7):
+            write_raw(raw, f"tow_bot_2026_03_0{d}_0815.csv", pd.Timestamp(f"2026-03-0{d} 08:15:00"),
+                      [[d + i * 0.01, d] for i in range(100)])
+        condense(cfg, raw, "Tower_Bot")
+        return {p.name: pd.read_parquet(p) for p in (tmp_path / out / "out" / "Tower_Bot").glob("*.parquet")}
+
+    serial, parallel = run(1, "a"), run(4, "b")
+    assert sorted(serial) == sorted(parallel) and len(serial) == 6
+    for name in serial:
+        pd.testing.assert_frame_equal(serial[name], parallel[name])
+
+
+def test_cached_listing_is_reused_until_refreshed(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    cfg["listing_cache_hours"] = 24
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), [[1.0, 1.0]] * 50)
+    assert condense(cfg, raw, "Tower_Bot").summary["processed"] == 1
+    assert (tmp_path / "out" / "Tower_Bot" / "listing.json").exists()
+
+    write_raw(raw, "tow_bot_2026_03_11_0815.csv", pd.Timestamp("2026-03-11 08:15:00"), [[1.0, 1.0]] * 50)
+    result = condense(cfg, raw, "Tower_Bot")  # the share is not listed again
+    assert result.summary["processed"] == 0 and result.summary["already_done"] == 1
+
+    result = condense(cfg, raw, "Tower_Bot", refresh_listing=True)
+    assert [p.name for p in result.processed] == ["tow_bot_2026_03_11_0815.csv"]
+
+
+def test_progress_callback_reports_each_raw_file(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    for d in (10, 11):
+        write_raw(raw, f"tow_bot_2026_03_{d}_0815.csv", pd.Timestamp(f"2026-03-{d} 08:15:00"), [[1.0, 1.0]] * 50)
+    seen = []
+    condense(cfg, raw, "Tower_Bot", progress=seen.append)
+    assert len(seen) == 2 and "2/2" in seen[-1]

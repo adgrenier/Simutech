@@ -35,6 +35,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,7 +71,8 @@ class CondenseResult:
                 "failed": len(self.failed)}
 
 
-def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult:
+def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: bool = False,
+             progress=None) -> CondenseResult:
     """Condense one Logger's Raw files into Summary files.
 
     Raw files are found in `raw_folder` (default: the Logger's `folder` setting) and
@@ -91,6 +93,14 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
     `settle_seconds` ago (default 0) or whose last row is incomplete is still being
     written: it is returned in `result.pending` and retried on the next run. A file that
     cannot be parsed goes in `result.failed` and the run continues.
+
+    Backlog-scale settings: `workers` (per Logger, else top level, default 8) Raw files
+    are read in parallel. `listing_cache_hours` (default 0 = list the folder every run)
+    keeps the Raw file listing in `<output_folder>/<Logger>/listing.json` and reuses it
+    while younger than that, because listing the storage server takes minutes; files
+    added since are only seen after it expires or with `refresh_listing=True`. Moving
+    `start_date` earlier only adds the files (and seconds) the old start date cut.
+    `progress`, if given, is called with one line of text per Raw file read.
     """
     if not isinstance(config, dict):
         config = json.loads(Path(config).read_text(encoding="utf-8"))
@@ -104,43 +114,70 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
 
     out_dir = Path(config["output_folder"]) / logger
     checkpoint_path = out_dir / CHECKPOINT
-    checkpoint, saved_start = _load_checkpoint(checkpoint_path)
+    checkpoint, saved_start, cut = _load_checkpoint(checkpoint_path)
     if saved_start is not None and (start is None or start < saved_start):
-        checkpoint = {}  # start date moved earlier: files cut by the old one are redone
+        for key in cut:  # start date moved earlier: redo only the files the old one cut into
+            checkpoint.pop(key, None)
+        cut = set()
     now = time.time()
 
     result = CondenseResult()
     root = Path(raw_folder if raw_folder is not None else cfg["folder"])
-    frames: list[list[pd.DataFrame]] = [[] for _ in mappings]  # per mapping
-    n_files, new_entries, keys = 0, {}, []  # keys[i]: checkpoint key of file number i
-    for path in _discover(root, pattern):
-        key = path.relative_to(root).as_posix()  # weekly folders repeat file names
-        if start is not None and _name_date_before(path.name, start - pd.Timedelta(days=1)):
+    cache_hours = float(cfg.get("listing_cache_hours", config.get("listing_cache_hours", 0)))
+    listing = _listing(root, pattern, out_dir / LISTING, cache_hours, refresh_listing)
+    todo = []  # (key, path, entry): files to read
+    for key, size, mtime_ns in listing:
+        name = key.rsplit("/", 1)[-1]
+        if start is not None and _name_date_before(name, start - pd.Timedelta(days=1)):
             continue  # cheap pre-filter; the exact cut is on the UTC second below
-        st = path.stat()
-        entry = [st.st_size, st.st_mtime_ns]
+        path = root / key  # key: path relative to root; weekly folders repeat file names
+        entry = [size, mtime_ns]
         if checkpoint.get(key) == entry:
             result.already_done.append(path)
-            continue
+        else:
+            todo.append((key, path, entry))
+
+    workers = max(1, int(cfg.get("workers", config.get("workers", DEFAULT_WORKERS))))
+    now = time.time()
+
+    def load(item):  # runs in a worker thread: the slow part is reading the share
+        _, path, entry = item
         try:
-            if now - st.st_mtime < settle or _incomplete(path):
+            if now - entry[1] / 1e9 < settle or _incomplete(path):
+                return "pending", None
+            return "ok", _read_raw(path)
+        except Exception as exc:  # one bad file must not stop the run
+            return "failed", f"{type(exc).__name__}: {exc}"
+
+    frames: list[list[pd.DataFrame]] = [[] for _ in mappings]  # per mapping
+    n_files, new_entries, keys = 0, {}, []  # keys[i]: checkpoint key of file number i
+    new_cut = set(cut)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for n_read, ((key, path, entry), (status, df)) in enumerate(zip(todo, pool.map(load, todo)), 1):
+            if progress is not None:
+                progress(f"{logger}: file {n_read}/{len(todo)} {key}")
+            if status == "pending":
                 result.pending.append(path)
                 continue
-            df = _read_raw(path)
-        except Exception as exc:  # one bad file must not stop the run
-            result.failed.append((path, f"{type(exc).__name__}: {exc}"))
-            continue
-        match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META)
-        if match is None:
-            result.skipped.append(path)
-            continue
-        if start is not None and (_second_starts(df) - offset).max() < start:
-            continue  # wholly before the start date: left out, not checkpointed
-        frames[match].append(df.assign(_file=n_files))
-        keys.append(key)
-        n_files += 1
-        result.processed.append(path)
-        new_entries[key] = entry
+            if status == "failed":
+                result.failed.append((path, df))
+                continue
+            match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META)
+            if match is None:
+                result.skipped.append(path)
+                continue
+            new_cut.discard(key)
+            if start is not None:
+                utc = _second_starts(df) - offset
+                if utc.max() < start:
+                    continue  # wholly before the start date: left out, not checkpointed
+                if utc.min() < start:
+                    new_cut.add(key)  # partly cut: redone if the start date moves earlier
+            frames[match].append(df.assign(_file=n_files))
+            keys.append(key)
+            n_files += 1
+            result.processed.append(path)
+            new_entries[key] = entry
 
     stuck_window = cfg.get("stuck_window_seconds",
                            config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
@@ -168,7 +205,7 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
                                                 stuck_window)
     if new_entries:
         checkpoint.update(new_entries)
-        _save_checkpoint(checkpoint_path, checkpoint, start)
+        _save_checkpoint(checkpoint_path, checkpoint, start, new_cut)
     result.report = build_report_data(logger, out_dir, kept_rows, checkpoint, result.skipped)
     result.report_file = write_report(result.report, out_dir / f"{logger}_report.html")
     return result
@@ -204,13 +241,44 @@ def _match(mappings, date, n_channels) -> int | None:
     return None
 
 
-def _discover(root: Path, pattern: str) -> list[Path]:
-    """Files under `root` matching the Logger's name pattern; Card copies are skipped."""
+def _discover(root: Path, pattern: str) -> list[tuple[str, int, int]]:
+    """(path relative to `root`, size, mtime_ns) of files under `root` matching the Logger's
+    name pattern, in folder then name order; Card copies are skipped. One scandir pass:
+    on Windows the size and time come with the listing, with no extra call per file."""
     found = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d.lower() != CARD_FOLDER)
-        found += [Path(dirpath) / f for f in sorted(filenames) if fnmatch.fnmatch(f.lower(), pattern)]
+    stack = [root]
+    while stack:
+        folder = stack.pop()
+        with os.scandir(folder) as it:
+            entries = sorted(it, key=lambda e: e.name)
+        subs = [e.path for e in entries if e.is_dir() and e.name.lower() != CARD_FOLDER]
+        for e in entries:
+            if e.is_file() and fnmatch.fnmatch(e.name.lower(), pattern):
+                st = e.stat()
+                found.append((Path(e.path).relative_to(root).as_posix(), st.st_size, st.st_mtime_ns))
+        stack.extend(Path(p) for p in reversed(subs))
     return found
+
+
+def _listing(root: Path, pattern: str, cache_path: Path, max_age_hours: float,
+             refresh: bool) -> list[tuple[str, int, int]]:
+    """`_discover`, or the cached listing of the same folder and pattern if young enough."""
+    if max_age_hours > 0 and not refresh:
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (data["root"] == str(root) and data["pattern"] == pattern
+                    and time.time() - data["listed_at"] < max_age_hours * 3600):
+                return [tuple(f) for f in data["files"]]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+    files = _discover(root, pattern)
+    if max_age_hours > 0:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"root": str(root), "pattern": pattern, "listed_at": time.time(),
+                                   "files": files}), encoding="utf-8")
+        tmp.replace(cache_path)
+    return files
 
 
 def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
@@ -249,23 +317,27 @@ def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
 
 
 CHECKPOINT = "checkpoint.json"
+LISTING = "listing.json"
+DEFAULT_WORKERS = 8
 _NAME_DATE = re.compile(r"(\d{4})_(\d{2})_(\d{2})")
 
 
-def _load_checkpoint(path: Path) -> tuple[dict, pd.Timestamp | None]:
+def _load_checkpoint(path: Path) -> tuple[dict, pd.Timestamp | None, set]:
+    """(files, start date of the last run, files that run cut into at the start date)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         saved = data.get("start_date")
-        return data["files"], pd.Timestamp(saved) if saved else None
+        return data["files"], pd.Timestamp(saved) if saved else None, set(data.get("cut", []))
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return {}, None
+        return {}, None, set()
 
 
-def _save_checkpoint(path: Path, files: dict, start) -> None:
+def _save_checkpoint(path: Path, files: dict, start, cut: set) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(
-        {"start_date": str(start.date()) if start is not None else None, "files": files},
+        {"start_date": str(start.date()) if start is not None else None, "files": files,
+         "cut": sorted(cut & files.keys())},
         indent=0, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
