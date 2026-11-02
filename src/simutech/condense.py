@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,8 @@ import pandas as pd
 from .report import build_report_data, write_report
 
 MISSING = -7999
+CARD_FOLDER = "card"  # copy of the Logger's memory card, never read
+DATE_IN_NAME = re.compile(r"_(\d{4})_(\d{2})_(\d{2})(?:_|\.)")
 DEFAULT_STUCK_WINDOW_SECONDS = 5
 DEFAULT_CLIPPING_THRESHOLD = 7900.0
 N_META = 5  # table id, year, day-of-year, HHMM, seconds
@@ -68,7 +71,12 @@ class CondenseResult:
 
 
 def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult:
-    """Condense one Logger's Raw files in `raw_folder` into Summary files.
+    """Condense one Logger's Raw files into Summary files.
+
+    Raw files are found in `raw_folder` (default: the Logger's `folder` setting) and
+    all its subfolders (year and weekly folders), except folders named `Card`. Each is
+    mapped to Channel names by the date in its name and its column count; a file that
+    fits no mapping is skipped and listed in `result.skipped`.
 
     `config` is a dict or the path of a JSON config file (see config.example.json).
 
@@ -87,7 +95,7 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
     if not isinstance(config, dict):
         config = json.loads(Path(config).read_text(encoding="utf-8"))
     cfg = config["loggers"][logger]
-    names = [c["name"] for c in cfg["channels"]]
+    mappings = _mappings(cfg)
     offset = pd.Timedelta(hours=cfg["clock_offset_hours"])
     pattern = cfg["file_pattern"].lower()
     settle = float(cfg.get("settle_seconds", 0))
@@ -102,37 +110,47 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
     now = time.time()
 
     result = CondenseResult()
-    frames, new_entries = [], {}
-    for path in sorted(Path(raw_folder).iterdir()):
-        if not path.is_file() or not fnmatch.fnmatch(path.name.lower(), pattern):
-            continue
+    root = Path(raw_folder if raw_folder is not None else cfg["folder"])
+    frames: list[list[pd.DataFrame]] = [[] for _ in mappings]  # per mapping
+    n_files, new_entries, keys = 0, {}, []  # keys[i]: checkpoint key of file number i
+    for path in _discover(root, pattern):
+        key = path.relative_to(root).as_posix()  # weekly folders repeat file names
         if start is not None and _name_date_before(path.name, start - pd.Timedelta(days=1)):
             continue  # cheap pre-filter; the exact cut is on the UTC second below
         st = path.stat()
         entry = [st.st_size, st.st_mtime_ns]
-        if checkpoint.get(path.name) == entry:
+        if checkpoint.get(key) == entry:
             result.already_done.append(path)
             continue
         try:
             if now - st.st_mtime < settle or _incomplete(path):
                 result.pending.append(path)
                 continue
-            df = _read_raw(path, len(names))
+            df = _read_raw(path)
         except Exception as exc:  # one bad file must not stop the run
             result.failed.append((path, f"{type(exc).__name__}: {exc}"))
             continue
-        if df is None:
+        match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META)
+        if match is None:
             result.skipped.append(path)
             continue
         if start is not None and (_second_starts(df) - offset).max() < start:
             continue  # wholly before the start date: left out, not checkpointed
-        frames.append(df.assign(_file=len(frames)))
+        frames[match].append(df.assign(_file=n_files))
+        keys.append(key)
+        n_files += 1
         result.processed.append(path)
-        new_entries[path.name] = entry
+        new_entries[key] = entry
 
-    kept_rows = {}
-    if frames:
-        raw = pd.concat(frames, ignore_index=True)
+    stuck_window = cfg.get("stuck_window_seconds",
+                           config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
+    clip = cfg.get("clipping_threshold", config.get("clipping_threshold", DEFAULT_CLIPPING_THRESHOLD))
+    summaries = []
+    kept_rows: dict[str, int] = {}  # checkpoint key -> kept 50 Hz rows, this run
+    for (_, _, names), group in zip(mappings, frames):
+        if not group:
+            continue
+        raw = pd.concat(group, ignore_index=True)
         stamps = _second_starts(raw) - offset  # logger clock -> UTC
         # duplicate seconds across files: keep only the later file's rows
         latest = raw["_file"].groupby(stamps).transform("max")
@@ -140,20 +158,59 @@ def condense(config, raw_folder, logger: str, start_date=None) -> CondenseResult
         if start is not None:
             keep &= (stamps >= start).to_numpy()
         raw, stamps = raw[keep], stamps[keep]
-        kept_rows = {result.processed[i].name: int(n) for i, n in raw.groupby("_file").size().items()}
-        stuck_window = cfg.get("stuck_window_seconds",
-                               config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
-        clip = cfg.get("clipping_threshold",
-                       config.get("clipping_threshold", DEFAULT_CLIPPING_THRESHOLD))
+        for i, n in raw.groupby("_file").size().items():
+            kept_rows[keys[i]] = int(n)
         if len(raw):
-            summary = _summarise(raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1),
-                                 stamps, stuck_window, clip)
-            result.summary_files = _merge_into_days(out_dir, logger, summary, stuck_window)
+            summaries.append(_summarise(raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1),
+                                        stamps, stuck_window, clip))
+    if summaries:
+        result.summary_files = _merge_into_days(out_dir, logger, pd.concat(summaries, ignore_index=True),
+                                                stuck_window)
+    if new_entries:
         checkpoint.update(new_entries)
         _save_checkpoint(checkpoint_path, checkpoint, start)
     result.report = build_report_data(logger, out_dir, kept_rows, checkpoint, result.skipped)
     result.report_file = write_report(result.report, out_dir / f"{logger}_report.html")
     return result
+
+
+def _mappings(cfg) -> list[tuple]:
+    """(first date, last date, channel names) per Channel mapping; dates are inclusive, None = open."""
+    if "channel_mappings" not in cfg:
+        return [(None, None, [c["name"] for c in cfg["channels"]])]
+    return [(pd.Timestamp(m["from"]) if m.get("from") else None,
+             pd.Timestamp(m["to"]) if m.get("to") else None,
+             [c["name"] for c in m["channels"]]) for m in cfg["channel_mappings"]]
+
+
+def _file_date(path: Path) -> pd.Timestamp | None:
+    """Logger-clock date in the file name (`..._YYYY_MM_DD_...`), if it has one."""
+    m = DATE_IN_NAME.search(path.name)
+    try:
+        return pd.Timestamp(int(m[1]), int(m[2]), int(m[3])) if m else None
+    except ValueError:
+        return None
+
+
+def _match(mappings, date, n_channels) -> int | None:
+    """Index of the first mapping whose date range holds `date` and whose Channel count fits."""
+    for i, (first, last, names) in enumerate(mappings):
+        if date is None:
+            in_range = first is None and last is None
+        else:
+            in_range = (first is None or date >= first) and (last is None or date <= last)
+        if in_range and len(names) == n_channels:
+            return i
+    return None
+
+
+def _discover(root: Path, pattern: str) -> list[Path]:
+    """Files under `root` matching the Logger's name pattern; Card copies are skipped."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d.lower() != CARD_FOLDER)
+        found += [Path(dirpath) / f for f in sorted(filenames) if fnmatch.fnmatch(f.lower(), pattern)]
+    return found
 
 
 def _merge_into_days(out_dir: Path, logger: str, summary: pd.DataFrame,
@@ -231,14 +288,14 @@ def _incomplete(path: Path) -> bool:
     return lines[-1].count(b",") != lines[0].count(b",")
 
 
-def _read_raw(path: Path, n_channels: int) -> pd.DataFrame | None:
-    """Parse a headerless Raw file; None if its column count matches no mapping.
+def _read_raw(path: Path) -> pd.DataFrame | None:
+    """Parse a headerless Raw file; None if it cannot be read as one.
     Raises ValueError on non-numeric content."""
     try:
         df = pd.read_csv(path, header=None)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
         return None
-    if df.shape[1] != N_META + n_channels:
+    if df.shape[1] <= N_META:
         return None
     return df.apply(pd.to_numeric)  # ValueError names the bad value
 

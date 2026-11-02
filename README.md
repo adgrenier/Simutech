@@ -20,6 +20,18 @@ Each run also writes a self-contained quality report, `<output_folder>/<Logger>/
 (daily trends, full-second share, -7999 share, stuck and clipping counts, skipped files). Its
 data is returned as `result.report` and documented in `src/simutech/report.py`.
 
+### All four Loggers
+
+`config.json` holds the real settings for Hub, Nacelle, Tower_Top and Tower_Bot, derived from the
+Logger programs (see its `_comment` entries for what was and was not verified). Raw files are
+searched under each Logger's `folder` and all subfolders (year and `Week_NN`), skipping `Card`
+folders and names that do not match `file_pattern`. A Logger can list `channel_mappings`
+(`from`/`to` dates, inclusive, read from the Raw file name, plus `channels`) instead of a single
+`channels` list; a file is mapped by its date and its column count, otherwise it is skipped and
+listed in `result.skipped`. `raw_folder` may be `None` to use the Logger's `folder`.
+
+### Data health and incremental runs
+
 Optional data-health settings (per Logger or top level): `stuck_window_seconds` (default 5,
 consecutive zero-std seconds that set `stuck`) and `clipping_threshold` (default 7900, absolute
 value counted in `n_clipped`). Duplicate seconds across Raw files keep the later file's rows.
