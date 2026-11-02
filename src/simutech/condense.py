@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .report import build_report_data, write_report
+
 MISSING = -7999
 DEFAULT_STUCK_WINDOW_SECONDS = 5
 DEFAULT_CLIPPING_THRESHOLD = 7900.0
@@ -44,6 +46,8 @@ N_META = 5  # table id, year, day-of-year, HHMM, seconds
 class CondenseResult:
     summary_files: list[Path] = field(default_factory=list)
     skipped: list[Path] = field(default_factory=list)  # Raw files that matched no mapping
+    report: dict = field(default_factory=dict)  # quality report data, see simutech.report
+    report_file: Path | None = None  # self-contained HTML rendering of `report`
 
 
 def condense(config, raw_folder, logger: str) -> CondenseResult:
@@ -71,6 +75,7 @@ def condense(config, raw_folder, logger: str) -> CondenseResult:
         frames.append(df.assign(_file=len(frames)))
 
     out_dir = Path(config["output_folder"]) / logger
+    summary, n_samples = None, 0
     if frames:
         raw = pd.concat(frames, ignore_index=True)
         stamps = _second_starts(raw) - offset  # logger clock -> UTC
@@ -78,6 +83,7 @@ def condense(config, raw_folder, logger: str) -> CondenseResult:
         latest = raw["_file"].groupby(stamps).transform("max")
         keep = (raw["_file"] == latest).to_numpy()
         raw, stamps = raw[keep], stamps[keep]
+        n_samples = len(raw)
         stuck_window = cfg.get("stuck_window_seconds",
                                config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
         clip = cfg.get("clipping_threshold",
@@ -89,6 +95,8 @@ def condense(config, raw_folder, logger: str) -> CondenseResult:
             path = out_dir / f"{logger}_{day}.parquet"
             part.reset_index(drop=True).to_parquet(path, index=False)
             result.summary_files.append(path)
+    result.report = build_report_data(logger, summary, n_samples, result.skipped)
+    result.report_file = write_report(result.report, out_dir / f"{logger}_report.html")
     return result
 
 
