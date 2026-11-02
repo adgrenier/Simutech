@@ -1,0 +1,3 @@
+# Treat TOA5 timestamps as UTC, with a separate per-Logger offset
+
+From 2024-09 the Loggers write TOA5 files, and their `TIMESTAMP` is UTC, not the fixed UTC-4 of the older headerless files (ADR 0002), although the programs still call `NetworkTimeProtocol(..., -4, ...)`. Evidence (2026-11-02): in the Hub file `hub_data_2026_11_02_1829.csv` the last row is 18:34:55.98 and the file's modified time is 13:35:08 UTC-5, i.e. 18:35:08 UTC. So the clock offset is a setting per format: `clock_offset_hours` for headerless files (default -4) and `toa5_clock_offset_hours` for TOA5 files (default 0). ADR 0002 still holds for headerless files. Not yet confirmed with the owner; if it is wrong, change the one setting and rerun.

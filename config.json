@@ -5,6 +5,7 @@
     "Raw files are found under each Logger's folder and all its subfolders (year and Week_NN folders); Card folders are never read.",
     "A Raw file is mapped by the date in its name (Logger clock, inclusive ranges) and its column count; files that match no mapping are skipped and listed in the result.",
     "VERIFIED (2026-11-02): all four programs (Hub_2020_09_04_005/006, Nacelle_2020_09_04_008 and Nacelle_2021_08_24_009, Tow_Bot_2020_09_04_009, Tow_Top_2020_09_04_006) call NetworkTimeProtocol(\"10.0.0.4\", -4, 10) in a 24 h SlowSequence, so every Logger clock is UTC-4 (ADR 0002), including Nacelle and Tower_Top.",
+    "TOA5 files (2024-09 onward, header lines then rows with a TIMESTAMP column) are read in the same folders as headerless files. `clock_offset_hours` (default -4) applies to headerless files only; `toa5_clock_offset_hours` (default 0, UTC, ADR 0003) applies to TOA5 files. A TOA5 file's Channel names and units must equal a mapping's, else it is skipped and listed.",
     "NOT VERIFIED: the clock offset was checked in the programs only, not against current-year files (no Nacelle, Tower_Top or Tower_Bot files exist under the 2026 folders at the time of writing; Hub 2026 files were not compared with an external clock).",
     "NOT VERIFIED: the exact dates where a Logger program changed. Hub 12 -> 15 channels and Nacelle 15 -> 12 channels are dated from the program file dates (Hub_..._006 saved 2021-08-23, Nacelle_..._009 saved 2021-08-24); a Raw file in the gap fails the column-count check and is skipped and listed.",
     "NOT VERIFIED: programs 001-004 (Aug-Sep 2020) of every Logger were not read; Raw files before 2020-09-04 are unmapped and would be skipped.",
@@ -18,6 +19,7 @@
       "folder": "M:/0373-03/Logger_Data/Hub",
       "file_pattern": "hub_data_*.csv",
       "clock_offset_hours": -4,
+      "toa5_clock_offset_hours": 0,
       "channel_mappings": [
         {
           "_comment": "Program Hub_2020_09_04_005: 12 blade bridges, 12 columns after the 5 meta columns (confirmed on Hub_Data_2020_09_04_1823.csv).",
@@ -65,6 +67,7 @@
       "folder": "M:/0373-03/Logger_Data/Nacelle",
       "file_pattern": "nacelle_data_*.csv",
       "clock_offset_hours": -4,
+      "toa5_clock_offset_hours": 0,
       "channel_mappings": [
         {
           "_comment": "Program Nacelle_2020_09_04_008: 15 channels (confirmed on nacelle_data_2020_09_04_1823.csv). Pitch_Speed has no Units line in the program.",
@@ -112,6 +115,7 @@
       "folder": "M:/0373-03/Logger_Data/Tower_Top",
       "file_pattern": "tow_top_data_*.csv",
       "clock_offset_hours": -4,
+      "toa5_clock_offset_hours": 0,
       "_comment": "Program Tow_Top_2020_09_04_006 (latest): 3 channels (confirmed on tow_top_data_2020_09_04_1823.csv). Earlier programs 001-005 not read.",
       "channels": [
         {"name": "Tow_Top_Bend_00", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},
@@ -123,6 +127,7 @@
       "folder": "M:/0373-03/Logger_Data/Tower_Bottom",
       "file_pattern": "tow_bot_*.csv",
       "clock_offset_hours": -4,
+      "toa5_clock_offset_hours": 0,
       "_comment": "Program Tow_Bot_2020_09_04_009 (latest): 2 channels (confirmed on tow_bot_2020_09_04_1823.csv and tow_bot_2021_*.csv). The data folder is Tower_Bottom, the programs folder is Tower_Bot.",
       "channels": [
         {"name": "Tow_Bot_Bend_00", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},

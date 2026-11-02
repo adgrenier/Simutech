@@ -30,6 +30,19 @@ folders and names that do not match `file_pattern`. A Logger can list `channel_m
 `channels` list; a file is mapped by its date and its column count, otherwise it is skipped and
 listed in `result.skipped`. `raw_folder` may be `None` to use the Logger's `folder`.
 
+### Two Raw file formats (headerless and TOA5)
+
+From 2024-09 the Loggers write TOA5 files (four header lines: metadata, field names, units,
+processing; then `TIMESTAMP`, `RECORD` and the Channels; missing values are the text `NAN`).
+Each file is detected on its own (first line starts with `"TOA5"`), so both formats can sit in the
+same Logger folders. A TOA5 file's Channel names and units are read from its header and must equal
+a mapping in the config (and its date range); otherwise it is skipped and listed. `NAN` counts as
+missing like -7999, and the sub-second `TIMESTAMP` (e.g. `18:29:56.12`) is used directly. Clock
+offsets are per format: `clock_offset_hours` for headerless files (default -4, ADR 0002) and
+`toa5_clock_offset_hours` for TOA5 files (default 0, i.e. UTC, ADR 0003). Duplicate seconds, the
+checkpoint, bands and the report work across both formats. `file_pattern` may be a string or a list
+of patterns (e.g. `tow_bot_*.csv` matches `tow_bot_data_*.csv` too).
+
 ### Data health and incremental runs
 
 Optional data-health settings (per Logger or top level): `stuck_window_seconds` (default 5,

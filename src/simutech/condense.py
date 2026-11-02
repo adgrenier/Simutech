@@ -27,6 +27,10 @@ Bands: a Channel with a `bands` list in the config adds `band_<name>_rms` float6
 (NaN where a Channel has no such band) and a `dominant_<Logger>.parquet` file; see
 `simutech.bands`.
 
+TOA5 Raw files (2024-09 onward) are read next to headerless ones, see `_read_raw`;
+`clock_offset_hours` (default -4) is for headerless files, `toa5_clock_offset_hours` (default 0,
+UTC) for TOA5 files.
+
 Config settings (per Logger, else top level, else default):
     stuck_window_seconds  default 5     consecutive zero-std seconds to flag stuck
     clipping_threshold    default 7900  absolute value counted as clipped
@@ -54,6 +58,10 @@ CARD_FOLDER = "card"  # copy of the Logger's memory card, never read
 DATE_IN_NAME = re.compile(r"_(\d{4})_(\d{2})_(\d{2})(?:_|\.)")
 DEFAULT_STUCK_WINDOW_SECONDS = 5
 DEFAULT_CLIPPING_THRESHOLD = 7900.0
+TOA5_MARK = b'"TOA5"'
+TOA5_HEADER_ROWS = 4  # metadata, field names, units, processing
+DEFAULT_CLOCK_OFFSET_HOURS = -4  # headerless Raw files, ADR 0002
+DEFAULT_TOA5_OFFSET_HOURS = 0  # TOA5 files are UTC, ADR 0003
 N_META = 5  # table id, year, day-of-year, HHMM, seconds
 
 
@@ -111,8 +119,10 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
         config = json.loads(Path(config).read_text(encoding="utf-8"))
     cfg = config["loggers"][logger]
     mappings = _mappings(cfg)
-    offset = pd.Timedelta(hours=cfg["clock_offset_hours"])
-    pattern = cfg["file_pattern"].lower()
+    offset = pd.Timedelta(hours=cfg.get("clock_offset_hours", DEFAULT_CLOCK_OFFSET_HOURS))
+    toa5_offset = pd.Timedelta(hours=cfg.get("toa5_clock_offset_hours", DEFAULT_TOA5_OFFSET_HOURS))
+    patterns = cfg["file_pattern"]
+    pattern = [p.lower() for p in ([patterns] if isinstance(patterns, str) else patterns)]
     settle = float(cfg.get("settle_seconds", 0))
     start = start_date if start_date is not None else config.get("start_date")
     start = pd.Timestamp(start) if start is not None else None
@@ -150,7 +160,7 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
         try:
             if now - entry[1] / 1e9 < settle or _incomplete(path):
                 return "pending", None
-            return "ok", _read_raw(path)
+            return "ok", _read_raw(path, offset - toa5_offset)
         except Exception as exc:  # one bad file must not stop the run
             return "failed", f"{type(exc).__name__}: {exc}"
 
@@ -167,7 +177,8 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
             if status == "failed":
                 result.failed.append((path, df))
                 continue
-            match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META)
+            df, header = df
+            match = None if df is None else _match(mappings, _file_date(path), df.shape[1] - N_META, header)
             if match is None:
                 result.skipped.append(path)
                 continue
@@ -194,7 +205,7 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
     band_state = _bands.load_state(band_state_path) if bands_by_channel else {}
     dominant_rows: list[dict] = []
     kept_rows: dict[str, int] = {}  # checkpoint key -> kept 50 Hz rows, this run
-    for (_, _, names), group in zip(mappings, frames):
+    for (_, _, names, _), group in zip(mappings, frames):
         if not group:
             continue
         raw = pd.concat(group, ignore_index=True)
@@ -230,12 +241,13 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
 
 
 def _mappings(cfg) -> list[tuple]:
-    """(first date, last date, channel names) per Channel mapping; dates are inclusive, None = open."""
+    """(first date, last date, channel names, units) per Channel mapping; dates are inclusive, None = open."""
     if "channel_mappings" not in cfg:
-        return [(None, None, [c["name"] for c in cfg["channels"]])]
+        return [(None, None, [c["name"] for c in cfg["channels"]], [c.get("unit") for c in cfg["channels"]])]
     return [(pd.Timestamp(m["from"]) if m.get("from") else None,
              pd.Timestamp(m["to"]) if m.get("to") else None,
-             [c["name"] for c in m["channels"]]) for m in cfg["channel_mappings"]]
+             [c["name"] for c in m["channels"]], [c.get("unit") for c in m["channels"]])
+            for m in cfg["channel_mappings"]]
 
 
 def _bands_by_channel(cfg) -> dict[str, list[dict]]:
@@ -298,19 +310,22 @@ def _file_date(path: Path) -> pd.Timestamp | None:
         return None
 
 
-def _match(mappings, date, n_channels) -> int | None:
-    """Index of the first mapping whose date range holds `date` and whose Channel count fits."""
-    for i, (first, last, names) in enumerate(mappings):
+def _match(mappings, date, n_channels, header=None) -> int | None:
+    """Index of the first mapping whose date range holds `date` and whose Channel count fits.
+    A TOA5 file (`header` = (names, units) read from it) must also match the mapping's names
+    and units exactly."""
+    for i, (first, last, names, units) in enumerate(mappings):
         if date is None:
             in_range = first is None and last is None
         else:
             in_range = (first is None or date >= first) and (last is None or date <= last)
-        if in_range and len(names) == n_channels:
+        if in_range and len(names) == n_channels and (
+                header is None or (list(header[0]) == names and list(header[1]) == units)):
             return i
     return None
 
 
-def _discover(root: Path, pattern: str) -> list[tuple[str, int, int]]:
+def _discover(root: Path, patterns: list[str]) -> list[tuple[str, int, int]]:
     """(path relative to `root`, size, mtime_ns) of files under `root` matching the Logger's
     name pattern, in folder then name order; Card copies are skipped. One scandir pass:
     on Windows the size and time come with the listing, with no extra call per file."""
@@ -322,14 +337,14 @@ def _discover(root: Path, pattern: str) -> list[tuple[str, int, int]]:
             entries = sorted(it, key=lambda e: e.name)
         subs = [e.path for e in entries if e.is_dir() and e.name.lower() != CARD_FOLDER]
         for e in entries:
-            if e.is_file() and fnmatch.fnmatch(e.name.lower(), pattern):
+            if e.is_file() and any(fnmatch.fnmatch(e.name.lower(), p) for p in patterns):
                 st = e.stat()
                 found.append((Path(e.path).relative_to(root).as_posix(), st.st_size, st.st_mtime_ns))
         stack.extend(Path(p) for p in reversed(subs))
     return found
 
 
-def _listing(root: Path, pattern: str, cache_path: Path, max_age_hours: float,
+def _listing(root: Path, pattern: list[str], cache_path: Path, max_age_hours: float,
              refresh: bool) -> list[tuple[str, int, int]]:
     """`_discover`, or the cached listing of the same folder and pattern if young enough."""
     if max_age_hours > 0 and not refresh:
@@ -426,19 +441,39 @@ def _incomplete(path: Path) -> bool:
     if not data.endswith(b"\n"):
         return True
     lines = data.splitlines()
-    return lines[-1].count(b",") != lines[0].count(b",")
+    first = lines[1] if data.startswith(TOA5_MARK) and len(lines) > 1 else lines[0]  # TOA5: field names
+    return lines[-1].count(b",") != first.count(b",")
 
 
-def _read_raw(path: Path) -> pd.DataFrame | None:
-    """Parse a headerless Raw file; None if it cannot be read as one.
-    Raises ValueError on non-numeric content."""
+def _read_raw(path: Path, shift: pd.Timedelta = pd.Timedelta(0)):
+    """Parse a Raw file into (frame, header); (None, None) if it cannot be read.
+
+    Headerless file: frame is the file as is, header None. TOA5 file (first line starts with
+    "TOA5"): the TIMESTAMP column is split into the headerless layout (table id 0, year,
+    day-of-year, HHMM, seconds) and moved by `shift` (headerless offset minus TOA5 offset) so
+    that, once the headerless offset is subtracted, it is UTC; `NAN` becomes -7999; header is
+    (Channel names, units) from the file. Raises ValueError on non-numeric content."""
+    with open(path, "rb") as f:
+        toa5 = f.read(len(TOA5_MARK)) == TOA5_MARK
     try:
-        df = pd.read_csv(path, header=None)
+        if not toa5:
+            df = pd.read_csv(path, header=None)
+            return (None, None) if df.shape[1] <= N_META else (df.apply(pd.to_numeric), None)
+        head = pd.read_csv(path, header=None, nrows=3, skiprows=1, dtype=str, engine="python")
+        df = pd.read_csv(path, header=None, skiprows=TOA5_HEADER_ROWS, dtype=str, na_values=[], keep_default_na=False)
     except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
-        return None
-    if df.shape[1] <= N_META:
-        return None
-    return df.apply(pd.to_numeric)  # ValueError names the bad value
+        return None, None
+    if df.shape[1] <= 2:
+        return None, None
+    names, units = list(head.iloc[0, 2:]), list(head.iloc[1, 2:])
+    stamps = pd.to_datetime(df.iloc[:, 0], format="ISO8601") + shift  # ValueError on bad text
+    values = df.iloc[:, 2:].replace("NAN", str(MISSING)).apply(pd.to_numeric)
+    ms = (stamps.dt.second * 1000 + stamps.dt.microsecond // 1000).to_numpy()
+    out = pd.DataFrame({"t": 0, "year": stamps.dt.year, "doy": stamps.dt.dayofyear,
+                        "hhmm": stamps.dt.hour * 100 + stamps.dt.minute, "sec": ms / 1000})
+    out = pd.concat([out, values.set_axis(range(5, 5 + values.shape[1]), axis=1)], axis=1)
+    out.columns = range(out.shape[1])
+    return out, (names, units)
 
 
 def _second_starts(raw: pd.DataFrame) -> pd.Series:

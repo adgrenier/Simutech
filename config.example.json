@@ -5,6 +5,7 @@
       "folder": "M:/0373-03/Logger_Data/Tower_Bottom",
       "file_pattern": "tow_bot_*.csv",
       "clock_offset_hours": -4,
+      "toa5_clock_offset_hours": 0,
       "channels": [
         {"name": "Tow_Bot_Bend_00", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},
         {"name": "Tow_Bot_Bend_90", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]}
