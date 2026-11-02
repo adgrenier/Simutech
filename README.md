@@ -16,6 +16,16 @@ units, and `output_folder` (keep it local, not on the storage server). The run w
 match the Channel list are skipped and returned in `result.skipped`. The table layout is
 documented in the docstring of `src/simutech/condense.py`.
 
+Runs are incremental and idempotent. `<output_folder>/<Logger>/checkpoint.json` records the
+Raw files already condensed (name, size, modification time); later runs only process new or
+changed files and merge their Summaries into the daily files, so a rerun changes nothing.
+Optional settings: `start_date` (config top level, or `condense(..., start_date=...)`) ignores
+earlier Raw files and seconds; per-Logger `settle_seconds` (default 0) treats a Raw file
+modified more recently than that, or with an incomplete last row, as still being written
+(`result.pending`, retried next run). A file that cannot be parsed goes in `result.failed`
+and the run continues. `result.summary` holds the end-of-run counts. Moving `start_date`
+earlier redoes the files it previously cut.
+
 ## Tests
 
 ```
