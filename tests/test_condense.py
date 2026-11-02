@@ -144,3 +144,69 @@ def test_rerun_gives_identical_output(tmp_path):
     first = read_day(tmp_path, "2026-03-10")
     condense(cfg, raw, "Tower_Bot")
     pd.testing.assert_frame_equal(first, read_day(tmp_path, "2026-03-10"))
+
+
+def test_clipping_count_uses_configurable_threshold(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    cfg["loggers"]["Tower_Bot"]["clipping_threshold"] = 10.0
+    rows = [[10.0 if i < 5 else (-10.0 if i < 8 else 1.0), 9.99] for i in range(50)]
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), rows)
+    condense(cfg, raw, "Tower_Bot")
+    df = read_day(tmp_path, "2026-03-10")
+    assert list(df[df.channel == "Bend_00"].n_clipped) == [8]  # either rail
+    assert list(df[df.channel == "Bend_90"].n_clipped) == [0]
+
+
+def test_clipping_default_threshold_and_missing_never_clips(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    rows = [[MISSING if i < 10 else 1.0, 7950.0 if i < 4 else 1.0] for i in range(50)]
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), rows)
+    condense(cfg, raw, "Tower_Bot")
+    df = read_day(tmp_path, "2026-03-10")
+    assert list(df[df.channel == "Bend_00"].n_clipped) == [0]
+    assert list(df[df.channel == "Bend_90"].n_clipped) == [4]
+
+
+def test_stuck_sensor_flagged_after_window_of_zero_std_seconds(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    cfg["loggers"]["Tower_Bot"]["stuck_window_seconds"] = 3
+    rows = []
+    for sec in range(8):
+        for i in range(50):
+            # ch0 constant in seconds 1-3 (run of 3) and 5-6 (run of 2); ch1 always varies
+            flat = sec in (1, 2, 3, 5, 6)
+            rows.append([2.0 if flat else float(i % 5), float(i % 3)])
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"), rows)
+    condense(cfg, raw, "Tower_Bot")
+    df = read_day(tmp_path, "2026-03-10").sort_values("timestamp_utc")
+    ch0 = df[df.channel == "Bend_00"]
+    assert list(ch0.stuck) == [False, True, True, True, False, False, False, False]
+    assert not df[df.channel == "Bend_90"].stuck.any()
+
+
+def test_stuck_default_window_is_five_seconds(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"),
+              [[1.0, 1.0]] * 300 + [[float(i % 2), 3.0] for i in range(50)])
+    condense(cfg, raw, "Tower_Bot")
+    df = read_day(tmp_path, "2026-03-10").sort_values("timestamp_utc")
+    ch0 = df[df.channel == "Bend_00"]
+    assert list(ch0.stuck) == [True] * 6 + [False]  # 6 flat seconds, then one varying
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"),
+              [[1.0, 1.0]] * 200 + [[float(i % 2), 0.0] for i in range(50)])
+    condense(cfg, raw, "Tower_Bot")
+    ch0 = read_day(tmp_path, "2026-03-10").query("channel == 'Bend_00'").sort_values("timestamp_utc")
+    assert not ch0.stuck.any()  # 4 flat seconds is below the window
+
+
+def test_duplicate_seconds_across_files_keep_later_files_rows(tmp_path):
+    raw, cfg = make_config(tmp_path)
+    write_raw(raw, "tow_bot_2026_03_10_0815.csv", pd.Timestamp("2026-03-10 08:15:00"),
+              [[1.0, 1.0]] * 150)  # seconds 0, 1, 2
+    write_raw(raw, "tow_bot_2026_03_10_0816.csv", pd.Timestamp("2026-03-10 08:15:02"),
+              [[5.0, 5.0]] * 100)  # restarted file: seconds 2, 3
+    condense(cfg, raw, "Tower_Bot")
+    df = read_day(tmp_path, "2026-03-10")
+    ch0 = df[df.channel == "Bend_00"].sort_values("timestamp_utc")
+    assert list(ch0["mean"]) == [1.0, 1.0, 5.0, 5.0]
+    assert list(ch0.n_valid) == [50, 50, 50, 50]  # never double-counted
