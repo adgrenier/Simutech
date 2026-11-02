@@ -46,6 +46,13 @@ modified more recently than that, or with an incomplete last row, as still being
 and the run continues. `result.summary` holds the end-of-run counts. Moving `start_date`
 earlier redoes the files it previously cut.
 
+### Cross-Logger comparison page
+
+`python -m simutech.compare config.json [Logger ...]` runs the condensing run for each Logger
+(default: all in the config) and writes `<output_folder>/comparison.html`: every Logger's data
+health and daily-mean trend side by side, linking to each Logger's own report. Its data is
+returned by `simutech.compare.compare(...).data` and documented in `src/simutech/compare.py`.
+
 ## Tests
 
 ```
