@@ -23,6 +23,10 @@ Incremental runs (see `condense`): the Summary files are updated in place from n
 changed Raw files; settings `start_date` (top level) and `settle_seconds` (per Logger,
 default 0) are described there.
 
+Bands: a Channel with a `bands` list in the config adds `band_<name>_rms` float64 columns
+(NaN where a Channel has no such band) and a `dominant_<Logger>.parquet` file; see
+`simutech.bands`.
+
 Config settings (per Logger, else top level, else default):
     stuck_window_seconds  default 5     consecutive zero-std seconds to flag stuck
     clipping_threshold    default 7900  absolute value counted as clipped
@@ -42,6 +46,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import bands as _bands
 from .report import build_report_data, write_report
 
 MISSING = -7999
@@ -183,6 +188,11 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
                            config.get("stuck_window_seconds", DEFAULT_STUCK_WINDOW_SECONDS))
     clip = cfg.get("clipping_threshold", config.get("clipping_threshold", DEFAULT_CLIPPING_THRESHOLD))
     summaries = []
+    bands_by_channel = _bands_by_channel(cfg)
+    band_settings = _bands.BandSettings(cfg, config)
+    band_state_path = out_dir / _bands.STATE_FILE
+    band_state = _bands.load_state(band_state_path) if bands_by_channel else {}
+    dominant_rows: list[dict] = []
     kept_rows: dict[str, int] = {}  # checkpoint key -> kept 50 Hz rows, this run
     for (_, _, names), group in zip(mappings, frames):
         if not group:
@@ -198,11 +208,19 @@ def condense(config, raw_folder, logger: str, start_date=None, refresh_listing: 
         for i, n in raw.groupby("_file").size().items():
             kept_rows[keys[i]] = int(n)
         if len(raw):
-            summaries.append(_summarise(raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1),
-                                        stamps, stuck_window, clip))
+            values = raw.iloc[:, N_META:N_META + len(names)].set_axis(names, axis=1)
+            summary = _summarise(values, stamps, stuck_window, clip)
+            if bands_by_channel:
+                times = _epoch_ms(_sample_times(raw) - offset)
+                summary = _add_bands(summary, values, times, bands_by_channel, band_settings,
+                                     band_state, dominant_rows)
+            summaries.append(summary)
     if summaries:
         result.summary_files = _merge_into_days(out_dir, logger, pd.concat(summaries, ignore_index=True),
                                                 stuck_window)
+    if bands_by_channel and summaries:
+        _bands.save_state(band_state_path, band_state)
+        _merge_dominant(out_dir / f"dominant_{logger}.parquet", dominant_rows)
     if new_entries:
         checkpoint.update(new_entries)
         _save_checkpoint(checkpoint_path, checkpoint, start, new_cut)
@@ -218,6 +236,57 @@ def _mappings(cfg) -> list[tuple]:
     return [(pd.Timestamp(m["from"]) if m.get("from") else None,
              pd.Timestamp(m["to"]) if m.get("to") else None,
              [c["name"] for c in m["channels"]]) for m in cfg["channel_mappings"]]
+
+
+def _bands_by_channel(cfg) -> dict[str, list[dict]]:
+    """Configured bands per Channel name (Channels without bands are left out)."""
+    entries = list(cfg.get("channels", []))
+    for m in cfg.get("channel_mappings", []):
+        entries += m["channels"]
+    return {c["name"]: c["bands"] for c in entries if c.get("bands")}
+
+
+def _epoch_ms(times: pd.Series) -> np.ndarray:
+    return times.to_numpy().astype("datetime64[ms]").astype(np.int64)
+
+
+def _add_bands(summary, values, times, bands_by_channel, settings, state, dominant_rows):
+    """Add `band_<name>_rms` columns (NaN for Channels without that band) to the Summary rows."""
+    data_end = int(times.max())
+    for name in _bands.band_names(bands_by_channel):
+        summary[f"band_{name}_rms"] = np.nan
+    summary = summary.set_index(["timestamp_utc", "channel"])
+    for name, bands in bands_by_channel.items():
+        if name not in values.columns:
+            continue
+        x = values[name].to_numpy(dtype=float)
+        ok = x != MISSING
+        order = np.argsort(times[ok], kind="stable")
+        out, rows = _bands.process_channel(name, bands, times[ok][order], x[ok][order], data_end,
+                                           settings, state)
+        dominant_rows += rows
+        if len(out):
+            out = out.set_index(out["timestamp_utc"].astype(summary.index.levels[0].dtype))
+            for col in out.columns[1:]:
+                idx = pd.MultiIndex.from_arrays([out.index, [name] * len(out)])
+                summary.loc[idx.intersection(summary.index), col] = out[col].to_numpy()[
+                    idx.isin(summary.index)]
+    return summary.reset_index()
+
+
+def _merge_dominant(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    new = pd.DataFrame(rows)
+    new["n_valid"] = new["n_valid"].astype("int64")
+    if path.exists():
+        old = pd.read_parquet(path)
+        keys = pd.MultiIndex.from_frame(new[["window_start_utc", "channel"]])
+        old = old[~pd.MultiIndex.from_frame(old[["window_start_utc", "channel"]]).isin(keys)]
+        new = pd.concat([old, new], ignore_index=True)
+    new = new.sort_values(["window_start_utc", "channel"], kind="stable").reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new.to_parquet(path, index=False)
 
 
 def _file_date(path: Path) -> pd.Timestamp | None:
@@ -379,6 +448,17 @@ def _second_starts(raw: pd.DataFrame) -> pd.Series:
     days = pd.to_timedelta(doy.to_numpy() - 1, unit="D")
     clock = pd.to_timedelta((hhmm // 100).to_numpy(), unit="h") + pd.to_timedelta(
         (hhmm % 100).to_numpy(), unit="min") + pd.to_timedelta(whole, unit="s")
+    jan1 = pd.to_datetime(year.astype(str) + "-01-01")
+    return pd.Series(jan1 + days + clock, index=raw.index)
+
+
+def _sample_times(raw: pd.DataFrame) -> pd.Series:
+    """Time of each row (20 ms steps) on the Logger's own clock."""
+    year, doy, hhmm, sec = (raw.iloc[:, i] for i in (1, 2, 3, 4))
+    ms = np.round(sec.to_numpy() * 1000).astype(np.int64)
+    days = pd.to_timedelta(doy.to_numpy() - 1, unit="D")
+    clock = pd.to_timedelta((hhmm // 100).to_numpy(), unit="h") + pd.to_timedelta(
+        (hhmm % 100).to_numpy(), unit="min") + pd.to_timedelta(ms, unit="ms")
     jan1 = pd.to_datetime(year.astype(str) + "-01-01")
     return pd.Series(jan1 + days + clock, index=raw.index)
 

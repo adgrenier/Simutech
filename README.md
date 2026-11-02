@@ -60,6 +60,18 @@ Prints one progress line per Raw file and a summary per Logger; exits 1 if a fil
 or with `--refresh-listing`. `workers` (default 8) reads Raw files in parallel. Moving
 `start_date` earlier only adds the Raw files (and first seconds) the old start date cut.
 
+### Band-limited RMS and dominant frequency
+
+Channels may carry `"bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, ...]` in the config
+(see `config.json`; edges confirmed by the owner, see `docs/research/band-proposal-tower-fft.md`).
+Each band adds a Summary column `band_<name>_rms`: the RMS of a continuous Butterworth band-pass
+filter (state carried across seconds, Raw files and incremental runs in `bandstate.npz`, reset after
+a gap or -7999 stretch longer than `band_reset_gap_seconds`, default 1) over a rolling
+`band_window_seconds` window (default 10), published once per UTC second. Each Channel with bands
+also gets one row per UTC-aligned 10-minute window in `dominant_<Logger>.parquet`
+(`dominant_hz`, `amplitude`, searched between the Channel's lowest and highest band edge). Details
+in `src/simutech/bands.py`. Needs `scipy`.
+
 ### Cross-Logger comparison page
 
 `python -m simutech.compare config.json [Logger ...]` runs the condensing run for each Logger

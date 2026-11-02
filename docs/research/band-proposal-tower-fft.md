@@ -1,6 +1,6 @@
 # Band proposal from Tower_Top FFT (issue #8, parent spec #1)
 
-Status: PROPOSAL ONLY. The owner has not confirmed any band below. Acceptance criterion "Owner confirms the bands" is still open, and nothing here should be copied into `config.json` until the owner agrees.
+Status: bands confirmed by the owner, see the Decision section at the end. The rest of this note is the original proposal.
 
 ![Welch spectra](band-proposal-tower-fft.png)
 
@@ -77,3 +77,13 @@ Band-limited RMS values measured in the proposed region (geometric mean of 00:09
 - Say the rotor speed range (rpm) so band A can be set safely below the tower mode.
 - Say whether the 10 and 20 Hz lines are a known artefact.
 - Decide how the 2026 TOA5 files are handled.
+
+## Decision
+
+Confirmed by the owner (issue #9):
+
+- Tower bend channels (Tow_Top_Bend_00/90, Tow_Bot_Bend_00/90): band A 0.10 to 0.30 Hz, band B 0.30 to 0.40 Hz.
+- Hub Rot_Az_X/Y/Z: band A only, 0.10 to 0.35 Hz.
+- Bands C and D are not used (so Tower_Top Tor has no bands). Edges live in `config.json`.
+
+Still unknown: the rated rotor speed range (the upper edge of A assumes 1P stays below about 0.30 Hz, about 18 rpm) and which of Bend_00 and Bend_90 is fore-aft.

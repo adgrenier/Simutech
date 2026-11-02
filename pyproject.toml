@@ -2,7 +2,7 @@
 name = "simutech"
 version = "0.1.0"
 requires-python = ">=3.13"
-dependencies = ["pandas", "numpy", "pyarrow"]
+dependencies = ["pandas", "numpy", "pyarrow", "scipy"]
 
 [project.optional-dependencies]
 test = ["pytest"]

@@ -54,9 +54,9 @@
             {"name": "B3_Root_Flap", "unit": "mV/V"},
             {"name": "B3_Mid_Edge", "unit": "mV/V"},
             {"name": "B3_Mid_Flap", "unit": "mV/V"},
-            {"name": "Rot_Az_X", "unit": "mV"},
-            {"name": "Rot_Az_Y", "unit": "mV"},
-            {"name": "Rot_Az_Z", "unit": "mV"}
+            {"name": "Rot_Az_X", "unit": "mV", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.35}]},
+            {"name": "Rot_Az_Y", "unit": "mV", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.35}]},
+            {"name": "Rot_Az_Z", "unit": "mV", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.35}]}
           ]
         }
       ]
@@ -114,8 +114,8 @@
       "clock_offset_hours": -4,
       "_comment": "Program Tow_Top_2020_09_04_006 (latest): 3 channels (confirmed on tow_top_data_2020_09_04_1823.csv). Earlier programs 001-005 not read.",
       "channels": [
-        {"name": "Tow_Top_Bend_00", "unit": "mV/V"},
-        {"name": "Tow_Top_Bend_90", "unit": "mV/V"},
+        {"name": "Tow_Top_Bend_00", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},
+        {"name": "Tow_Top_Bend_90", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},
         {"name": "Tow_Top_Tor", "unit": "mV/V"}
       ]
     },
@@ -125,8 +125,8 @@
       "clock_offset_hours": -4,
       "_comment": "Program Tow_Bot_2020_09_04_009 (latest): 2 channels (confirmed on tow_bot_2020_09_04_1823.csv and tow_bot_2021_*.csv). The data folder is Tower_Bottom, the programs folder is Tower_Bot.",
       "channels": [
-        {"name": "Tow_Bot_Bend_00", "unit": "mV/V"},
-        {"name": "Tow_Bot_Bend_90", "unit": "mV/V"}
+        {"name": "Tow_Bot_Bend_00", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]},
+        {"name": "Tow_Bot_Bend_90", "unit": "mV/V", "bands": [{"name": "A", "low_hz": 0.10, "high_hz": 0.30}, {"name": "B", "low_hz": 0.30, "high_hz": 0.40}]}
       ]
     }
   }
